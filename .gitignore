@@ -10,3 +10,6 @@ monitor/dashboard.html
 
 # 日志
 *.log
+
+# 打包产物(release/ 含 APK 二进制 + 启动截图;截图含真实持仓数据,严禁提交)
+release/
