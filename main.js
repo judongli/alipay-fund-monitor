@@ -12,6 +12,13 @@ var ACT = "com.eg.android.AlipayGphone.AlipayLogin";
 var DATA_FILE = "/sdcard/Download/alipay_funds.json";
 var FIND_TO = 6000, WAIT = 1500, LOAD_WAIT = 3000;
 var COL = function (h) { return android.graphics.Color.parseColor(h); };
+var GD = android.graphics.drawable.GradientDrawable;
+// 圆角 / 圆形纸感背景(AutoX.js 无 CSS,用 GradientDrawable 还原)
+function roundRect(c, r, sc, sw) { var d = new GD(); d.setCornerRadius(r); d.setColor(COL(c)); if (sc) d.setStroke(sw, COL(sc)); return d; }
+function oval(c) { var d = new GD(); d.setShape(GD.OVAL); d.setColor(COL(c)); return d; }
+// 视图状态:搜索 + 排序(固定降序;名称用 localeCompare)
+var SORTS = [["amount", "金额"], ["yesterday", "昨日"], ["holding", "持有"], ["rate", "收益率"], ["name", "名称"]];
+var sortKey = "amount", sortDir = -1, query = "", currentData = null, uiList = null, uiFoot = null;
 
 // ---------- 格式化 ----------
 function money(n) { n = n || 0; return "¥" + n.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ","); }
@@ -109,25 +116,110 @@ ui.layout(
         <horizontal bg="#fffdf8" padding="16 14" gravity="center_vertical">
             <vertical layout_weight="1">
                 <text text="支付宝 · 基金持仓" textColor="#1c1a17" textSize="15sp" textStyle="bold" />
-                <text id="meta" text="点「采集」获取数据" textColor="#8b857b" textSize="11sp" />
+                <text id="meta" text="点右上角刷新按钮获取数据" textColor="#8b857b" textSize="11sp" />
             </vertical>
-            <button id="btn" text="采集" textColor="#ffffff" bg="#1c1a17" textSize="13sp" padding="18 8" />
+            <button id="btn" w="44" h="44" text="↻" textColor="#ffffff" textSize="20sp" gravity="center" />
         </horizontal>
         <scroll layout_weight="1">
             <vertical id="body" padding="14">
-                <text text="还没有数据&#10;点右上角「采集」" textColor="#8b857b" textSize="14sp" gravity="center" padding="0 80" />
+                <text text="还没有数据&#10;点右上角刷新按钮采集" textColor="#8b857b" textSize="14sp" gravity="center" padding="0 80" />
             </vertical>
         </scroll>
     </vertical>
 );
 
+// 刷新按钮:圆形图标
+ui.btn.setBackground(oval("#1c1a17"));
+
+function applyQuerySort(funds, q, key, dir) {
+    return funds.slice()
+        .filter(function (f) { var qq = ("" + q).toLowerCase(); return !q || f.name.toLowerCase().indexOf(qq) >= 0; })
+        .sort(function (a, b) {
+            return key === "name" ? dir * a.name.localeCompare(b.name) : dir * (a[key] - b[key]);
+        });
+}
+
+function styleChip(v, active) {
+    v.setTextColor(COL(active ? "#ffffff" : "#8b857b"));
+    v.setBackground(roundRect(active ? "#1c1a17" : "#fffdf8", 12, active ? null : "#e7e1d4", 1));
+}
+
+// 工具区:搜索框 + 排序标签条(回填 query / 高亮,采集后保留筛选)
+function buildToolbar() {
+    var bar = ui.inflate(
+        <vertical margin="0 6 0 12">
+            <input id="qbox" hint="搜索基金名称…" textSize="13sp" textColor="#1c1a17" padding="12 11" margin="0 0 0 8" />
+            <horizontal id="chips" gravity="center_vertical" />
+        </vertical>);
+    bar.qbox.setBackground(roundRect("#fffdf8", 12, "#e7e1d4", 1));
+    if (query) bar.qbox.setText(query);
+    bar.qbox.addTextChangedListener(new android.text.TextWatcher({
+        beforeTextChanged: function (s, a, b, c) {}, onTextChanged: function (s, a, b, c) {},
+        afterTextChanged: function (s) { query = (s.toString() || "").toLowerCase(); renderList(currentData); }
+    }));
+    var refs = [];
+    SORTS.forEach(function (item) {
+        var key = item[0], label = item[1];
+        var chip = ui.inflate(<text id="c" textSize="12sp" padding="13 7" margin="0 0 7 0" gravity="center" />);
+        var apply = function () { chip.c.setText(label + (key === sortKey ? " ▼" : "")); styleChip(chip.c, key === sortKey); };
+        apply();
+        chip.c.on("click", function () {
+            sortKey = key;
+            refs.forEach(function (r) { r(); });
+            renderList(currentData);
+        });
+        refs.push(apply);
+        bar.chips.addView(chip);
+    });
+    ui.body.addView(bar);
+}
+
+// 卡片流(随搜索 / 排序重建)
+function renderList(d) {
+    if (!uiList || !d || !d.funds) return;
+    uiList.removeAllViews();
+    var rows = applyQuerySort(d.funds, query, sortKey, sortDir);
+    if (!rows.length) {
+        uiList.addView(ui.inflate(
+            <text text="没有匹配的基金" textColor="#8b857b" textSize="13sp" gravity="center" padding="0 30" />));
+    } else {
+        rows.forEach(function (f) {
+            var card = ui.inflate(
+                <vertical bg="#fffdf8" padding="13" margin="0 0 0 8">
+                    <text id="nm" textSize="13sp" textStyle="bold" textColor="#1c1a17" />
+                    <text id="tg" textSize="10sp" textColor="#8b857b" />
+                    <horizontal margin="0 8 0 0" gravity="center_vertical">
+                        <text id="am" layout_weight="1" textSize="17sp" textStyle="bold" textColor="#1c1a17" />
+                        <text id="rt" textSize="14sp" textStyle="bold" />
+                    </horizontal>
+                    <horizontal margin="0 4 0 0">
+                        <text id="yest" layout_weight="1" textSize="11sp" />
+                        <text id="hold" textSize="11sp" />
+                    </horizontal>
+                </vertical>);
+            card.setBackground(roundRect("#fffdf8", 12, "#e7e1d4", 1));
+            card.nm.setText(f.name);
+            card.tg.setText((f.jinxuan ? "支付宝金选  " : "") + (f.autoInvest ? "定投" : ""));
+            card.am.setText(money(f.amount));
+            card.rt.setText(pct(f.rate)); card.rt.setTextColor(COL(hexOf(f.rate)));
+            card.yest.setText("昨日 " + signed(f.yesterday)); card.yest.setTextColor(COL(hexOf(f.yesterday)));
+            card.hold.setText("持有 " + signed(f.holding)); card.hold.setTextColor(COL(hexOf(f.holding)));
+            uiList.addView(card);
+        });
+    }
+    var sum = rows.reduce(function (a, f) { return a + (f.amount || 0); }, 0);
+    uiFoot.setText("共 " + d.funds.length + " 只 · 显示 " + rows.length + " 只 · 合计 " + money(sum) +
+        "\n数据来源:支付宝「基金·持有」页 · 只读,不涉及交易");
+}
+
 function render(d) {
+    currentData = d;
     var body = ui.body;
     body.removeAllViews();
     if (!d || !d.funds || !d.funds.length) {
+        uiList = null; uiFoot = null;
         body.addView(ui.inflate(
-            <text text="还没有数据&#10;点右上角「采集」" textColor="#8b857b" textSize="14sp" gravity="center" padding="0 80" />
-        ));
+            <text text="还没有数据&#10;点右上角刷新按钮采集" textColor="#8b857b" textSize="14sp" gravity="center" padding="0 80" />));
         return;
     }
     var h = d.hdr || {};
@@ -146,33 +238,14 @@ function render(d) {
     var statTxt = ui.inflate(<text id="s" textSize="12sp" textColor="#6a645a" padding="2 0 0 0" margin="0 0 0 16" />);
     statTxt.s.setText(st.map(function (x) { return x[0] + " " + (x[1] == null ? "—" : signed(x[1])); }).join("    "));
     body.addView(statTxt);
-    // 基金卡
-    d.funds.forEach(function (f) {
-        var card = ui.inflate(
-            <vertical bg="#fffdf8" padding="13" margin="0 0 0 8">
-                <text id="nm" textSize="13sp" textStyle="bold" textColor="#1c1a17" />
-                <text id="tg" textSize="10sp" textColor="#8b857b" />
-                <horizontal margin="0 8 0 0" gravity="center_vertical">
-                    <text id="am" layout_weight="1" textSize="17sp" textStyle="bold" textColor="#1c1a17" />
-                    <text id="rt" textSize="14sp" textStyle="bold" />
-                </horizontal>
-                <horizontal margin="0 4 0 0">
-                    <text id="yest" layout_weight="1" textSize="11sp" />
-                    <text id="hold" textSize="11sp" />
-                </horizontal>
-            </vertical>);
-        card.nm.setText(f.name);
-        card.tg.setText((f.jinxuan ? "支付宝金选  " : "") + (f.autoInvest ? "定投" : ""));
-        card.am.setText(money(f.amount));
-        card.rt.setText(pct(f.rate)); card.rt.setTextColor(COL(hexOf(f.rate)));
-        card.yest.setText("昨日 " + signed(f.yesterday)); card.yest.setTextColor(COL(hexOf(f.yesterday)));
-        card.hold.setText("持有 " + signed(f.holding)); card.hold.setTextColor(COL(hexOf(f.holding)));
-        body.addView(card);
-    });
-    // 页脚
-    var foot = ui.inflate(<text textSize="11sp" textColor="#b8b1a6" gravity="center" padding="0 14" />);
-    foot.setText("共 " + d.funds.length + " 只基金 · 金额合计 " + money(d.funds.reduce(function (a, f) { return a + f.amount; }, 0)) + "\n数据来源:支付宝「基金·持有」页 · 只读,不涉及交易");
-    body.addView(foot);
+    // 工具区(搜索 + 排序)
+    buildToolbar();
+    // 卡片容器 + 页脚
+    uiList = ui.inflate(<vertical></vertical>);
+    body.addView(uiList);
+    uiFoot = ui.inflate(<text textSize="11sp" textColor="#b8b1a6" gravity="center" padding="0 14" />);
+    body.addView(uiFoot);
+    renderList(d);
 }
 
 function fmtTs(ts) { var d = new Date(ts); var p = function (n) { return ("0" + n).slice(-2); }; return "更新于 " + d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) + " " + p(d.getHours()) + ":" + p(d.getMinutes()); }
@@ -183,7 +256,7 @@ if (saved) { render(saved); ui.meta.setText(fmtTs(saved.ts)); }
 
 // 采集按钮
 ui.btn.on("click", function () {
-    ui.btn.setEnabled(false); ui.btn.setText("采集中…");
+    ui.btn.setEnabled(false); ui.btn.setAlpha(0.4);
     threads.start(function () {
         var myPkg = currentPackage(); // 记住本 App 包名,采集后切回
         var data, err;
@@ -192,7 +265,7 @@ ui.btn.on("click", function () {
         ui.post(function () {
             if (err) { toast("❌ " + err); }
             else { render(data); ui.meta.setText(fmtTs(data.ts)); toast("✅ 采集完成,共 " + data.funds.length + " 只基金"); }
-            ui.btn.setEnabled(true); ui.btn.setText("采集");
+            ui.btn.setEnabled(true); ui.btn.setAlpha(1);
             // 采集时切去了支付宝,现在切回本 App 看结果
             try { app.launchPackage(myPkg); } catch (e) {}
         });
