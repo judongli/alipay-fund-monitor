@@ -15,7 +15,6 @@ var COL = function (h) { return android.graphics.Color.parseColor(h); };
 var GD = android.graphics.drawable.GradientDrawable;
 // 圆角 / 圆形纸感背景(AutoX.js 无 CSS,用 GradientDrawable 还原)
 function roundRect(c, r, sc, sw) { var d = new GD(); d.setCornerRadius(r); d.setColor(COL(c)); if (sc) d.setStroke(sw, COL(sc)); return d; }
-function oval(c) { var d = new GD(); d.setShape(GD.OVAL); d.setColor(COL(c)); return d; }
 // 视图状态:搜索 + 排序(固定降序;名称用 localeCompare)
 var SORTS = [["amount", "金额"], ["yesterday", "昨日"], ["holding", "持有"], ["rate", "收益率"], ["name", "名称"]];
 var sortKey = "amount", sortDir = -1, query = "", currentData = null, uiList = null, uiFoot = null;
@@ -118,7 +117,7 @@ ui.layout(
                 <text text="支付宝 · 基金持仓" textColor="#1c1a17" textSize="15sp" textStyle="bold" />
                 <text id="meta" text="点右上角刷新按钮获取数据" textColor="#8b857b" textSize="11sp" />
             </vertical>
-            <button id="btn" w="44" h="44" text="↻" textColor="#1c1a17" textSize="20sp" gravity="center" />
+            <button id="btn" w="44" h="44" text="↻" textColor="#1c1a17" textSize="24sp" gravity="center" />
         </horizontal>
         <scroll layout_weight="1">
             <vertical id="body" padding="14">
@@ -128,8 +127,8 @@ ui.layout(
     </vertical>
 );
 
-// 刷新按钮:淡灰褐圆形印章(与纸面 header 形成柔和层次,非黑块)
-ui.btn.setBackground(oval("#efe9dc"));
+// 刷新按钮:纯图标(透明背景,完全融入 header)
+ui.btn.setBackground(new GD());
 
 function applyQuerySort(funds, q, key, dir) {
     return funds.slice()
