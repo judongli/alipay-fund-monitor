@@ -1,0 +1,7 @@
+{
+  "name": "支付宝基金监控",
+  "main": "main.js",
+  "versionName": "0.1.0",
+  "versionCode": 1,
+  "ignore": ["data/*", "*.md"]
+}

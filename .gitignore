@@ -1,0 +1,12 @@
+# macOS
+.DS_Store
+
+# OMC 运行状态
+.omc/
+
+# 生成数据(含真实基金持仓,严禁提交)
+monitor/funds.json
+monitor/dashboard.html
+
+# 日志
+*.log
