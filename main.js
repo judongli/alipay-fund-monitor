@@ -118,7 +118,7 @@ ui.layout(
                 <text text="支付宝 · 基金持仓" textColor="#1c1a17" textSize="15sp" textStyle="bold" />
                 <text id="meta" text="点右上角刷新按钮获取数据" textColor="#8b857b" textSize="11sp" />
             </vertical>
-            <button id="btn" w="44" h="44" text="↻" textColor="#ffffff" textSize="20sp" gravity="center" />
+            <button id="btn" w="44" h="44" text="↻" textColor="#1c1a17" textSize="20sp" gravity="center" />
         </horizontal>
         <scroll layout_weight="1">
             <vertical id="body" padding="14">
@@ -128,8 +128,8 @@ ui.layout(
     </vertical>
 );
 
-// 刷新按钮:圆形图标
-ui.btn.setBackground(oval("#1c1a17"));
+// 刷新按钮:淡灰褐圆形印章(与纸面 header 形成柔和层次,非黑块)
+ui.btn.setBackground(oval("#efe9dc"));
 
 function applyQuerySort(funds, q, key, dir) {
     return funds.slice()
@@ -140,8 +140,9 @@ function applyQuerySort(funds, q, key, dir) {
 }
 
 function styleChip(v, active) {
-    v.setTextColor(COL(active ? "#ffffff" : "#8b857b"));
-    v.setBackground(roundRect(active ? "#1c1a17" : "#fffdf8", 12, active ? null : "#e7e1d4", 1));
+    // 默认:纸面 + 描边 + 灰字;激活:淡灰褐印章 + 深墨字
+    v.setTextColor(COL(active ? "#1c1a17" : "#8b857b"));
+    v.setBackground(roundRect(active ? "#efe9dc" : "#fffdf8", 12, "#e7e1d4", 1));
 }
 
 // 工具区:搜索框 + 排序标签条(回填 query / 高亮,采集后保留筛选)
@@ -266,8 +267,14 @@ ui.btn.on("click", function () {
             if (err) { toast("❌ " + err); }
             else { render(data); ui.meta.setText(fmtTs(data.ts)); toast("✅ 采集完成,共 " + data.funds.length + " 只基金"); }
             ui.btn.setEnabled(true); ui.btn.setAlpha(1);
-            // 采集时切去了支付宝,现在切回本 App 看结果
-            try { app.launchPackage(myPkg); } catch (e) {}
         });
+        // 采集时切去了支付宝,现在切回本 App(多重尝试 + 验证,应对 MIUI 后台启动拦截)
+        var back = false;
+        for (var k = 0; k < 4; k++) {
+            try { app.launchPackage(myPkg); } catch (e) {}
+            sleep(700);
+            if (currentPackage() === myPkg) { back = true; break; }
+        }
+        if (!back) ui.post(function () { toast("采集完成,从后台切回本 App 查看"); });
     });
 });
