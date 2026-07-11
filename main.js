@@ -25,17 +25,89 @@ function signed(n) { return (n > 0 ? "+" : (n < 0 ? "−" : "")) + money(Math.ab
 function pct(r) { return (r >= 0 ? "+" : "−") + (Math.abs(r) * 100).toFixed(2) + "%"; }
 function hexOf(n) { return n > 0 ? "#c0392b" : (n < 0 ? "#2e8b57" : "#8b857b"); }
 
+// ---------- 悬浮窗(采集时浮在支付宝上方,实时显示当前步骤) ----------
+var fw = null, fx = 0, fy = 0, pulse = null;
+// 心跳:进行中红点缓慢呼吸;终态(完成/出错/切回)停心跳、定色
+function startPulse() {
+    if (!fw || pulse) return;
+    try {
+        var a = new android.view.animation.AlphaAnimation(1, 0.25);
+        a.setDuration(750);
+        a.setRepeatCount(android.view.animation.Animation.INFINITE);
+        a.setRepeatMode(android.view.animation.Animation.REVERSE);
+        fw.dot.startAnimation(a); pulse = a;
+    } catch (e) {}
+}
+function stopPulse() {
+    if (pulse) { try { pulse.cancel(); } catch (e) {} pulse = null; }
+    if (fw) { try { fw.dot.clearAnimation(); } catch (e) {} }
+}
+function openFloaty() {
+    if (fw) return;
+    try { fw = floaty.window(
+        <frame>
+            <vertical id="card" bg="#fffdf8" w="246" padding="14 11" margin="12">
+                <horizontal gravity="center_vertical">
+                    <text id="dot" text="●" textColor="#c0392b" textSize="11sp" margin="0 0 6 0" />
+                    <text text="采集进度" textColor="#8b857b" textSize="10sp" />
+                </horizontal>
+                <text id="op" text="准备中…" textColor="#1c1a17" textSize="13sp" textStyle="bold" margin="0 4 0 0" />
+            </vertical>
+        </frame>
+    ); } catch (e) { console.log("悬浮窗创建失败: " + e); fw = null; return; }
+    try {
+        fw.card.setBackground(roundRect("#fffdf8", 14, "#e7e1d4", 1));
+        fw.op.setMaxLines(2);
+        var dm = context.getResources().getDisplayMetrics();
+        fx = Math.floor((dm.widthPixels - 270 * dm.density) / 2); fy = 140; // 顶部居中(270dp = 卡片+边距)
+        fw.setPosition(fx, fy);
+        startPulse();
+        // 入场:中心缩放 + 淡入(DecelerateInterpolator 收尾,有"落定"感)
+        var ea = new android.view.animation.AlphaAnimation(0, 1);
+        var es = new android.view.animation.ScaleAnimation(0.9, 1, 0.9, 1, android.view.animation.Animation.RELATIVE_TO_SELF, 0.5, android.view.animation.Animation.RELATIVE_TO_SELF, 0.5);
+        var set = new android.view.animation.AnimationSet(false); set.addAnimation(ea); set.addAnimation(es); set.setDuration(300); set.setInterpolator(new android.view.animation.DecelerateInterpolator());
+        fw.card.startAnimation(set);
+    } catch (e) { console.log("悬浮窗样式失败: " + e); }
+}
+function closeFloaty() {
+    if (!fw) return;
+    stopPulse();
+    var w = fw, card = fw.card; fw = null;
+    try {
+        var out = new android.view.animation.AlphaAnimation(1, 0); out.setDuration(220);
+        out.setAnimationListener(new android.view.animation.Animation.AnimationListener({
+            onAnimationStart: function () {}, onAnimationRepeat: function () {},
+            onAnimationEnd: function () { try { w.close(); } catch (e) {} }
+        }));
+        card.startAnimation(out);
+    } catch (e) { try { w.close(); } catch (e2) {} }
+}
+// 统一状态出口:既写日志,又刷新悬浮窗(采集在子线程,文本更新需 post 到 UI 线程)
+// dotColor 可选:终态用(完成绿 / 出错红 / 切回灰),传入则停心跳、定色
+function status(msg, dotColor) {
+    console.log(msg);
+    if (!fw) return;
+    var m = msg, c = dotColor;
+    ui.post(function () {
+        try {
+            fw.op.setText(m);
+            if (c) { stopPulse(); fw.dot.setTextColor(COL(c)); }
+            var f = new android.view.animation.AlphaAnimation(0.35, 1); f.setDuration(160); fw.op.startAnimation(f); // 步骤切换:轻闪一下
+        } catch (e) {}
+    });
+}
+
 // ---------- 导航 / 采集 ----------
 function validBounds(b) { return b && b.bottom > b.top && b.top >= 0 && b.top <= device.height && (b.bottom - b.top) >= 10; }
 function clickableAncestor(w) { var cur = w; for (var i = 0; i < 8 && cur; i++) { var c = false; try { c = cur.clickable(); } catch (e) {} if (c) return cur; cur = cur.parent(); } return w; }
 function tapSmart(t) {
-    if (!text(t).findOne(FIND_TO)) { console.log("⚠️ 找不到「" + t + "」"); return false; }
+    if (!text(t).findOne(FIND_TO)) { status("⚠️ 找不到「" + t + "」"); return false; }
     var col = text(t).find(), pick = null;
     for (var i = 0; i < col.size(); i++) { if (validBounds(col.get(i).bounds())) { pick = col.get(i); break; } }
     if (!pick) pick = col.get(0);
     var b = pick.bounds(); if (!validBounds(b)) b = clickableAncestor(pick).bounds();
     click(Math.floor((b.left + b.right) / 2), Math.floor((b.top + b.bottom) / 2));
-    console.log("✓ 点「" + t + "」"); return true;
+    status("✓ 点「" + t + "」"); return true;
 }
 function isInAlipay() { var p = currentPackage(); return p.indexOf("Alipay") >= 0 || p.indexOf("alipay") >= 0; }
 function waitPkg(ms) { var t = 0; while (t < ms) { if (isInAlipay()) return true; sleep(400); t += 400; } return isInAlipay(); }
@@ -45,8 +117,8 @@ function onLicaiPage() {
 }
 function settle() { sleep(800); var prev = -1; for (var i = 0; i < 5; i++) { var n = -1; try { n = className("android.widget.TextView").find().size(); } catch (e) {} if (n > 0 && n === prev) break; prev = n; sleep(350); } }
 function openFundPage() {
-    if (!isInAlipay()) { try { app.launchPackage(PKG); } catch (e) {} if (!waitPkg(6000)) throw new Error("启动支付宝失败,请先手动打开支付宝"); }
-    settle();
+    if (!isInAlipay()) { status("启动支付宝…"); try { app.launchPackage(PKG); } catch (e) {} if (!waitPkg(6000)) throw new Error("启动支付宝失败,请先手动打开支付宝"); }
+    settle(); status("进入理财页…");
     // 无 root 无法强制重启支付宝;改用「检测+返回键」走到理财页,适配任意起始页
     for (var i = 0; i < 8; i++) {
         if (onLicaiPage()) break;
@@ -55,8 +127,8 @@ function openFundPage() {
         if (!isInAlipay()) { try { app.launchPackage(PKG); } catch (e) {} waitPkg(4000); }
     }
     if (!onLicaiPage()) throw new Error("未能到达理财页,请手动进支付宝「理财」页后重试");
-    tapSmart("基金"); sleep(WAIT); settle();
-    tapSmart("持有"); sleep(LOAD_WAIT); settle();
+    status("打开「基金」"); tapSmart("基金"); sleep(WAIT); settle();
+    status("打开「持有」"); tapSmart("持有"); sleep(LOAD_WAIT); settle();
 }
 function num(re, t) { var m = re.exec(t); return m ? +m[1] : null; }
 function parseFund(t) {
@@ -100,10 +172,13 @@ function parseFunds(texts) {
 }
 function collectFunds() {
     openFundPage();
+    status("等待持仓加载…");
     for (var i = 0; i < 20; i++) { if (textContains("持有收益率").findOne(400)) break; sleep(500); }
+    status("扫描基金卡片…");
     var allT = allTexts();
     var funds = parseFunds(allT);
     if (funds.length === 0) { sleep(1500); allT = allTexts(); funds = parseFunds(allT); } // 兜底再扫一次
+    status("已识别 " + funds.length + " 只基金");
     return { hdr: parseHdr(allT), funds: funds, ts: new Date().getTime() };
 }
 function saveData(d) { try { files.ensureDir(DATA_FILE); files.write(DATA_FILE, JSON.stringify(d)); } catch (e) { console.log("保存失败 " + e); } }
@@ -256,18 +331,22 @@ if (saved) { render(saved); ui.meta.setText(fmtTs(saved.ts)); }
 
 // 采集按钮
 ui.btn.on("click", function () {
+    // 悬浮窗需「显示在其他应用上层」权限;首次使用引导授权
+    if (!floaty.checkPermission()) { floaty.requestPermission(); toast("请授予「悬浮窗」权限后再次点击采集"); return; }
     ui.btn.setEnabled(false); ui.btn.setAlpha(0.4);
     threads.start(function () {
+        openFloaty(); // 在采集线程创建,避免 UI 线程阻塞
         var myPkg = currentPackage(); // 记住本 App 包名,采集后切回
         var data, err;
-        try { data = collectFunds(); saveData(data); }
-        catch (e) { err = e.message || String(e); }
+        try { data = collectFunds(); saveData(data); status("✅ 采集完成,共 " + data.funds.length + " 只", "#2e8b57"); }
+        catch (e) { err = e.message || String(e); status("❌ " + err, "#c0392b"); }
         ui.post(function () {
             if (err) { toast("❌ " + err); }
             else { render(data); ui.meta.setText(fmtTs(data.ts)); toast("✅ 采集完成,共 " + data.funds.length + " 只基金"); }
             ui.btn.setEnabled(true); ui.btn.setAlpha(1);
         });
         // 采集时切去了支付宝,现在切回本 App(多重尝试 + 验证,应对 MIUI 后台启动拦截)
+        status("切回本 App…", "#8b857b");
         var back = false;
         for (var k = 0; k < 4; k++) {
             try { app.launchPackage(myPkg); } catch (e) {}
@@ -275,5 +354,6 @@ ui.btn.on("click", function () {
             if (currentPackage() === myPkg) { back = true; break; }
         }
         if (!back) ui.post(function () { toast("采集完成,从后台切回本 App 查看"); });
+        sleep(600); closeFloaty();
     });
 });
