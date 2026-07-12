@@ -1813,9 +1813,9 @@ ui.layout(
                     <text text="支付宝 · 基金持仓" textColor="#1c1a17" textSize="15sp" textStyle="bold" />
                     <text id="meta" text="点右上角刷新按钮获取数据" textColor="#8b857b" textSize="11sp" />
                 </vertical>
-                <button id="cfg" w="40" h="40" text="⚙" textColor="#1c1a17" textSize="20sp" gravity="center" margin="6 0 0 0" />
-                <button id="runBtn" w="40" h="40" text="▶" textColor="#1c1a17" textSize="18sp" gravity="center" margin="4 0 0 0" />
-                <button id="btn" w="40" h="40" text="↻" textColor="#1c1a17" textSize="22sp" gravity="center" margin="4 0 0 0" />
+                <button id="cfg" w="36" h="36" text="⚙" textColor="#1c1a17" textSize="20sp" gravity="center" margin="0 0 0 8" padding="0" />
+                <button id="runBtn" w="36" h="36" text="▶" textColor="#1c1a17" textSize="16sp" gravity="center" margin="0 0 0 6" padding="0" />
+                <button id="btn" w="36" h="36" text="↻" textColor="#1c1a17" textSize="26sp" gravity="center|top" margin="0 0 0 6" padding="0" />
             </horizontal>
             <scroll layout_weight="1">
                 <vertical>
