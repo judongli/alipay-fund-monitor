@@ -4,14 +4,12 @@ const os = require('os');
 const path = require('path');
 const { checkGuard, ratioToShares, buildAudit, appendAudit } = require('../src/trade-logic.js');
 
-// checkGuard
-assert.deepStrictEqual(checkGuard({ name: 'A', amount: 100, whitelist: ['A'], maxAmount: 5000, confirmThreshold: 1000 }),
+// checkGuard(白名单已移除)
+assert.deepStrictEqual(checkGuard({ name: 'A', amount: 100, maxAmount: 5000, confirmThreshold: 1000 }),
     { ok: true, needConfirm: false, reason: '' });
-assert.strictEqual(checkGuard({ name: 'B', amount: 100, whitelist: ['A'], maxAmount: 5000, confirmThreshold: 1000 }).ok, false);
-assert.strictEqual(checkGuard({ name: 'B', amount: 100, whitelist: [], maxAmount: 5000, confirmThreshold: 1000 }).ok, true); // 白名单空=不校验
-assert.strictEqual(checkGuard({ name: 'A', amount: 6000, whitelist: ['A'], maxAmount: 5000, confirmThreshold: 1000 }).ok, false);
-assert.strictEqual(checkGuard({ name: 'A', amount: 2000, whitelist: ['A'], maxAmount: 5000, confirmThreshold: 1000 }).needConfirm, true);
-assert.strictEqual(checkGuard({ name: 'A', amount: 0.5, whitelist: ['A'], maxAmount: 5000, confirmThreshold: 1000 }).ok, false);
+assert.strictEqual(checkGuard({ name: 'A', amount: 6000, maxAmount: 5000, confirmThreshold: 1000 }).ok, false);
+assert.strictEqual(checkGuard({ name: 'A', amount: 2000, maxAmount: 5000, confirmThreshold: 1000 }).needConfirm, true);
+assert.strictEqual(checkGuard({ name: 'A', amount: 0.5, maxAmount: 5000, confirmThreshold: 1000 }).ok, false);
 
 // ratioToShares
 assert.strictEqual(ratioToShares(1 / 8, 1000), 125);

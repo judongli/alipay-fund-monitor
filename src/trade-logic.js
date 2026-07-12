@@ -1,10 +1,8 @@
 // 交易纯逻辑(无 AutoX.js 依赖,node 可测)。main.js 内联同一份(@sync)。
 
-/** 护栏校验 */
+/** 护栏校验(白名单已移除,改由组别/策略作用范围控制) */
 function checkGuard(o) {
-    var wl = o.whitelist || [];
     if (!o.amount || o.amount < 1) return { ok: false, needConfirm: false, reason: '金额必须 >=1.00' };
-    if (wl.length > 0 && wl.indexOf(o.name) < 0) return { ok: false, needConfirm: false, reason: '基金 ' + o.name + ' 不在白名单' };
     if (o.amount > o.maxAmount) return { ok: false, needConfirm: false, reason: '金额 ' + o.amount + ' 超上限 ' + o.maxAmount };
     var needConfirm = o.confirmThreshold != null && o.amount > o.confirmThreshold;
     return { ok: true, needConfirm: needConfirm, reason: '' };
