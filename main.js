@@ -100,10 +100,9 @@ function status(msg, dotColor) {
 }
 
 // ---------- 交易纯逻辑(@sync src/trade-logic.js,改动两处同步)----------
+// 护栏校验(白名单已移除,改由组别/策略作用范围控制)
 function checkGuard(o) {
-    var wl = o.whitelist || [];
     if (!o.amount || o.amount < 1) return { ok: false, needConfirm: false, reason: '金额必须 >=1.00' };
-    if (wl.length > 0 && wl.indexOf(o.name) < 0) return { ok: false, needConfirm: false, reason: '基金 ' + o.name + ' 不在白名单' };
     if (o.amount > o.maxAmount) return { ok: false, needConfirm: false, reason: '金额 ' + o.amount + ' 超上限 ' + o.maxAmount };
     var needConfirm = o.confirmThreshold != null && o.amount > o.confirmThreshold;
     return { ok: true, needConfirm: needConfirm, reason: '' };
@@ -118,32 +117,66 @@ var TRADE_LOG = "/sdcard/Download/alipay_trade.log";
 function appendAudit(line) { try { files.ensureDir(TRADE_LOG); files.append(TRADE_LOG, line + '\n'); return true; } catch (e) { console.log('审计写入失败 ' + e); return false; } }
 
 // ---------- 策略纯逻辑(@sync src/strategy-logic.js,改动两处同步)----------
-// 四套模板(底仓/定投/降本/止盈)默认都不执行,用户把想要的勾进策略池(inPool:true)才跑。
-// 买入金额=元,卖出=份(rate 为小数,0.068=6.8%)。
-// 多策略命中同一基金:按优先级 降本>底仓>定投 取一个。
-function planBuys(funds, S) {
+// 固定四种策略各一份实例,靠内部配置表达差异:
+//   base(全局)       持仓<目标 → 买 单次金额
+//   dca(组别级)       每个组别自带 dcaEnabled+dcaAmount;"全部基金"有 allEnabled+allAmount。
+//                    开关开的组,组内每只基金各按该组金额买一笔。
+//   costReduce(全局) 亏损(rate<0)→ 取最浅匹配档金额
+//   takeProfit(全局) 收益率达档 → 卖 1/分母
+// 冲突:一只基金被多个启用买入策略命中 → 取金额最高;并列按 降本>底仓>定投。
+// 金额归属:组别自带定投金额(不再逐基金填 entries);"全部基金"用 dca.allAmount。
+// 基金是否在定投作用范围内(groupId='ALL' 表示全部基金)
+function fundInGroup(fundName, groupId, groups) {
+    if (groupId === 'ALL') return true;
+    var g = null;
+    (groups || []).forEach(function (x) { if (x.id === groupId) g = x; });
+    return !!(g && (g.funds || []).indexOf(fundName) >= 0);
+}
+// 定投候选金额:收集该基金在所有启用定投来源中的金额(ALL + 各 dcaEnabled 组),返回金额列表
+function dcaCandidates(fundName, S, groups) {
+    var amts = [];
+    if (!S.dca || !S.dca.enabled) return amts;
+    if (S.dca.allEnabled && S.dca.allAmount >= 1) amts.push(S.dca.allAmount);
+    (groups || []).forEach(function (g) {
+        if (g.dcaEnabled && g.dcaAmount >= 1 && (g.funds || []).indexOf(fundName) >= 0) {
+            amts.push(g.dcaAmount);
+        }
+    });
+    return amts;
+}
+function planBuys(funds, S, groups) {
+    var TYPE_RANK = { costReduce: 0, base: 1, dca: 2 };
     var orders = [];
     (funds || []).forEach(function (f) {
-        var hit = null;
-        // 降本:rate<0,取最浅匹配档(tiers 按 maxLoss 升序,首个 rate>=-maxLoss 命中)
-        if (!hit && S.costReduce && S.costReduce.inPool && f.rate != null && f.rate < 0) {
+        var cands = [];
+        if (S.costReduce && S.costReduce.enabled && f.rate != null && f.rate < 0) {
             var tier = null;
             (S.costReduce.tiers || []).forEach(function (t) { if (!tier && f.rate >= -t.maxLoss) tier = t; });
-            if (tier) hit = { name: f.name, amount: tier.amount, strategy: 'costReduce' };
+            if (tier) cands.push({ amount: tier.amount, strategy: 'costReduce' });
         }
-        if (!hit && S.base && S.base.inPool && f.amount != null && f.amount < S.base.target) {
-            hit = { name: f.name, amount: S.base.amount, strategy: 'base' };
+        if (S.base && S.base.enabled && f.amount != null && f.amount < S.base.target) {
+            cands.push({ amount: S.base.amount, strategy: 'base' });
         }
-        if (!hit && S.dca && S.dca.inPool && (S.dca.whitelist || []).indexOf(f.name) >= 0) {
-            hit = { name: f.name, amount: S.dca.amount, strategy: 'dca' };
+        if (S.dca && S.dca.enabled) {
+            var dcaAmts = dcaCandidates(f.name, S, groups);
+            if (dcaAmts.length) {
+                var dcaMax = dcaAmts.reduce(function (a, b) { return a > b ? a : b; });
+                cands.push({ amount: dcaMax, strategy: 'dca' });
+            }
         }
-        if (hit) orders.push(hit);
+        if (!cands.length) return;
+        cands.sort(function (a, b) {
+            if (a.amount !== b.amount) return b.amount - a.amount;
+            return TYPE_RANK[a.strategy] - TYPE_RANK[b.strategy];
+        });
+        var w = cands[0];
+        orders.push({ name: f.name, amount: w.amount, strategy: w.strategy });
     });
     return orders;
 }
 function planSells(funds, S) {
     var orders = [];
-    if (!S.takeProfit || !S.takeProfit.inPool) return orders;
+    if (!S.takeProfit || !S.takeProfit.enabled) return orders;
     (funds || []).forEach(function (f) {
         if (f.rate == null || f.rate <= 0) return;
         var tier = null;
@@ -193,55 +226,193 @@ var secretStore = (function () {
     };
 })();
 
-// ---------- 交易配置(白名单/上限/dryRun + 策略池 + 定时器)----------
+// ---------- 交易配置(组别 + 上限/dryRun + 策略池)----------
+// 白名单已移除 → 改由"组别"(可复用基金集合)控制作用范围;"全部基金"是隐式默认组(groupId='ALL')。
+// 定时器已移除 → 策略引擎靠「立即执行」手动触发。
 var cfgStore = storages.create("fund_trade_cfg");
 var DEFAULT_CFG = {
-    whitelist: [], maxAmount: 5000, confirmThreshold: 1000, dryRun: true,
+    maxAmount: 5000, confirmThreshold: 1000, dryRun: true,
+    groups: [],                         // [{id, name, funds:[基金名], dcaEnabled, dcaAmount}] "全部"不入库
     strategies: {
-        base:       { inPool: false, target: 100, amount: 100 },
-        dca:        { inPool: false, amount: 100, whitelist: [] },
-        costReduce: { inPool: false, tiers: [{ maxLoss: 0.05, amount: 10 }, { maxLoss: 0.10, amount: 20 }] },
-        takeProfit: { inPool: false, tiers: [
+        base:       { enabled: false, target: 100, amount: 100 },                       // 全局:持仓<目标 → 买 单次金额
+        dca:        { enabled: false, allEnabled: false, allAmount: 100 },               // 组别级:allEnabled/allAmount 管全部基金;各组自带 dcaEnabled/dcaAmount
+        costReduce: { enabled: false, tiers: [{ maxLoss: 0.05, amount: 10 }, { maxLoss: 0.10, amount: 20 }] },
+        takeProfit: { enabled: false, tiers: [
             { minRate: 0.10, ratio: 8 }, { minRate: 0.15, ratio: 7 }, { minRate: 0.20, ratio: 6 },
             { minRate: 0.25, ratio: 5 }, { minRate: 0.30, ratio: 4 }, { minRate: 0.35, ratio: 3 },
             { minRate: 0.40, ratio: 2 }, { minRate: 0.45, ratio: 1 } ] },
     },
-    timer: { enabled: false, intervalMin: 60 },
 };
-// 深合并:顶层标量用 cfgStore 值,缺失则默认;strategies 子树逐模板合并(保留用户参数,补默认 inPool/tiers)
-function mergeObj(base, extra) {
-    var out = {};
-    Object.keys(base).forEach(function (k) { out[k] = base[k]; });
-    if (extra) Object.keys(extra).forEach(function (k) { out[k] = extra[k]; });
-    return out;
+// 旧字段迁移:dca 旧含 groupId/entries(逐基金)→ 新 allEnabled/allAmount(组别级)。旧 entries 无法映射,丢弃重配。
+function migrateStrategy(sk, saved) {
+    if (!saved || typeof saved !== 'object') return null;
+    var has = function (k) { return Object.prototype.hasOwnProperty.call(saved, k); };
+    if (sk === 'base') {
+        return {
+            enabled: has('enabled') ? !!saved.enabled : (has('inPool') ? !!saved.inPool : false),
+            target: has('target') ? saved.target : 100,
+            amount: has('amount') ? saved.amount : 100,
+        };
+    }
+    if (sk === 'dca') {
+        return {
+            enabled: has('enabled') ? !!saved.enabled : (has('inPool') ? !!saved.inPool : false),
+            allEnabled: has('allEnabled') ? !!saved.allEnabled : false,
+            allAmount: has('allAmount') ? saved.allAmount : 100,
+        };
+    }
+    if (sk === 'costReduce' || sk === 'takeProfit') {
+        return {
+            enabled: has('enabled') ? !!saved.enabled : (has('inPool') ? !!saved.inPool : false),
+            tiers: has('tiers') ? saved.tiers : DEFAULT_CFG.strategies[sk].tiers,
+        };
+    }
+    return null;
 }
 function loadTradeConfig() {
     var c = {};
-    Object.keys(DEFAULT_CFG).forEach(function (k) {
-        if (k === 'strategies') {
-            var s = {};
-            Object.keys(DEFAULT_CFG.strategies).forEach(function (sk) {
-                var saved = cfgStore.contains('strategies.' + sk) ? cfgStore.get('strategies.' + sk) : {};
-                s[sk] = mergeObj(DEFAULT_CFG.strategies[sk], saved);
-            });
-            c.strategies = s;
-        } else if (k === 'timer') {
-            c.timer = mergeObj(DEFAULT_CFG.timer, cfgStore.contains('timer') ? cfgStore.get('timer') : {});
-        } else {
-            c[k] = cfgStore.contains(k) ? cfgStore.get(k) : DEFAULT_CFG[k];
-        }
+    c.maxAmount = cfgStore.contains('maxAmount') ? cfgStore.get('maxAmount') : DEFAULT_CFG.maxAmount;
+    c.confirmThreshold = cfgStore.contains('confirmThreshold') ? cfgStore.get('confirmThreshold') : DEFAULT_CFG.confirmThreshold;
+    c.dryRun = cfgStore.contains('dryRun') ? cfgStore.get('dryRun') : DEFAULT_CFG.dryRun;
+    c.groups = cfgStore.contains('groups') ? (cfgStore.get('groups') || []) : [];
+    // 旧 groups 项无 dcaEnabled/dcaAmount,补默认(不破坏既有数据)
+    c.groups = c.groups.map(function (g) {
+        return {
+            id: g.id, name: g.name, funds: g.funds || [],
+            dcaEnabled: g.dcaEnabled === true,
+            dcaAmount: (g.dcaAmount != null && !isNaN(+g.dcaAmount)) ? +g.dcaAmount : 100,
+        };
     });
-    c.whitelist = c.whitelist || [];
+    var s = {};
+    Object.keys(DEFAULT_CFG.strategies).forEach(function (sk) {
+        var saved = cfgStore.contains('strategies.' + sk) ? cfgStore.get('strategies.' + sk) : null;
+        var mig = migrateStrategy(sk, saved);
+        s[sk] = mig || JSON.parse(JSON.stringify(DEFAULT_CFG.strategies[sk]));
+    });
+    c.strategies = s;
     return c;
 }
 function saveTradeConfig(o) { Object.keys(o).forEach(function (k) { cfgStore.put(k, o[k]); }); }
 function openConfigUI() { renderConfig(); }
 
-// rawInput 兼容 Promise(AutoX.js v6 rawInput 可能返回 Promise,同步处理会丢值)
+// ---------- 浮层卡片对话框(替代原生 dialogs.* 小白框,纸感风格)----------
+// 根布局含 overlay(id) + overlayCard(id)。showCard 渲染卡片并显示;点遮罩不关闭(防误触)。
+function showCard(contentView) {
+    var card = ui.overlayCard;
+    card.removeAllViews();
+    card.addView(contentView);
+    card.setBackground(roundRect("#fffdf8", 18, "#e7e1d4", 1));
+    ui.overlay.setVisibility(0);  // VISIBLE
+}
+function hideCard() { ui.overlay.setVisibility(8); }  // GONE
+// overlay 点击消费(防穿透到下层)
+ui.overlay.on("click", function () {});
+
+// 推断输入类型:密码→数字密码;金额/份额/元/份/目标/阈值/上限→数字;否则文本
+function inferInputType(title) {
+    var t = title || "";
+    if (t.indexOf("密码") >= 0) return "numberPassword";
+    if (t.indexOf("金额") >= 0 || t.indexOf("份额") >= 0 || t.indexOf("元") >= 0 ||
+        t.indexOf("份") >= 0 || t.indexOf("目标") >= 0 || t.indexOf("阈值") >= 0 || t.indexOf("上限") >= 0) return "number";
+    return "text";
+}
+
+// 选择菜单卡片:标题 + 选项行 + (取消项点选返回 -1)
+function cardSelect(title, items, cb, defaultIdx) {
+    var list = ui.inflate(
+        <vertical padding="4 4 4 2">
+            <text id="title" textSize="14sp" textStyle="bold" textColor="#1c1a17" padding="12 12 12 8" />
+            <vertical id="rows" />
+        </vertical>);
+    list.title.setText(title);
+    items.forEach(function (it, i) {
+        var isCancel = (it === "取消" || it === "✕ 取消");
+        var row = ui.inflate(
+            <horizontal gravity="center_vertical" padding="14 13" margin="6 0 6 2">
+                <text id="lab" textSize="13sp" textColor="#1c1a17" layout_weight="1" />
+            </horizontal>);
+        row.lab.setText(it);
+        row.setBackground(roundRect(isCancel ? "#f6f4ef" : "#fffdf8", 10, isCancel ? null : "#eee8db", isCancel ? 0 : 1));
+        if (isCancel) row.lab.setTextColor(COL("#8b857b"));
+        row.on("click", function () {
+            hideCard();
+            cb(isCancel ? -1 : i);
+        });
+        list.rows.addView(row);
+    });
+    showCard(list);
+}
+
+// 输入卡片:标题 + input + 确定/取消。inputType 自动推断(数字/密码/文本)
+function cardInput(title, prefill, hint, cb, inputType) {
+    var it = inputType || inferInputType(title);
+    var card = ui.inflate(
+        <vertical padding="16 16 14 14">
+            <text id="title" textSize="14sp" textStyle="bold" textColor="#1c1a17" padding="0 0 0 10" />
+            <input id="field" textSize="15sp" textColor="#1c1a17" padding="12 12" margin="0 0 14 14" />
+            <horizontal>
+                <text id="ok" text="✓ 确定" textSize="14sp" textStyle="bold" textColor="#fffdf8" padding="14 12" layout_weight="1" gravity="center" margin="0 0 6 0" />
+                <text id="cancel" text="✕ 取消" textSize="14sp" textStyle="bold" textColor="#8b857b" padding="14 12" layout_weight="1" gravity="center" margin="6 0 0 0" />
+            </horizontal>
+        </vertical>);
+    card.title.setText(title);
+    if (prefill != null) card.field.setText("" + prefill);
+    if (hint) card.field.setHint(hint);
+    card.field.setBackground(roundRect("#f6f4ef", 10, "#e7e1d4", 1));
+    try {
+        var IT = android.text.InputType;
+        var map = { number: IT.TYPE_CLASS_NUMBER, numberPassword: IT.TYPE_CLASS_NUMBER | IT.TYPE_NUMBER_VARIATION_PASSWORD, text: IT.TYPE_CLASS_TEXT, textPassword: IT.TYPE_CLASS_TEXT | IT.TYPE_TEXT_VARIATION_PASSWORD };
+        if (map[it]) card.field.setInputType(map[it]);
+    } catch (e) {}
+    card.ok.setBackground(roundRect("#1c1a17", 10, null, 0));
+    card.cancel.setBackground(roundRect("#f0ebe0", 10, null, 0));
+    card.ok.on("click", function () {
+        var v = card.field.getText().toString();
+        hideCard();
+        cb(v);
+    });
+    card.cancel.on("click", function () { hideCard(); cb(null); });
+    showCard(card);
+    try {
+        ui.post(function () {
+            card.field.requestFocus();
+            var imm = context.getSystemService(context.INPUT_METHOD_SERVICE);
+            imm.showSoftInput(card.field, 0);
+        }, 120);
+    } catch (e) {}
+}
+
+// 确认卡片:标题 + 消息 + 确认(红)/取消
+function cardConfirm(title, msg, cb) {
+    var card = ui.inflate(
+        <vertical padding="18 18 14 14">
+            <text id="title" textSize="15sp" textStyle="bold" textColor="#1c1a17" padding="0 0 0 8" />
+            <text id="msg" textSize="13sp" textColor="#6a645a" padding="0 0 16 0" />
+            <horizontal>
+                <text id="ok" text="✓ 确认" textSize="14sp" textStyle="bold" textColor="#fffdf8" padding="14 12" layout_weight="1" gravity="center" margin="0 0 6 0" />
+                <text id="cancel" text="✕ 取消" textSize="14sp" textStyle="bold" textColor="#8b857b" padding="14 12" layout_weight="1" gravity="center" margin="6 0 0 0" />
+            </horizontal>
+        </vertical>);
+    card.title.setText(title);
+    card.msg.setText(msg || "");
+    card.ok.setBackground(roundRect("#c0392b", 10, null, 0));
+    card.cancel.setBackground(roundRect("#f0ebe0", 10, null, 0));
+    card.ok.on("click", function () { hideCard(); cb(true); });
+    card.cancel.on("click", function () { hideCard(); cb(false); });
+    showCard(card);
+}
+
+// rawInput 兼容 Promise(旧);现底层走纸感卡片浮层,业务回调结构不变。
 function rawInputAsync(title, prefill, cb) {
-    var r = dialogs.rawInput(title, prefill);
-    if (r && typeof r.then === "function") r.then(cb);
-    else cb(r);
+    cardInput(title, prefill, null, cb);
+}
+// dialogs.select 旧封装;现底层走纸感卡片浮层。cb(-1) 表示取消/未选。
+function selectAsync(title, items, cb, defaultIdx) {
+    cardSelect(title, items, cb, defaultIdx);
+}
+// dialogs.confirm 封装(纸感卡片)
+function confirmAsync(title, msg, cb) {
+    cardConfirm(title, msg, cb);
 }
 
 // 配置页:在 ui.body 内重建为纸感卡片列表(不嵌套弹窗)
@@ -287,25 +458,7 @@ function renderConfig() {
         });
     body.addView(pinCard);
 
-    // 2. 基金白名单
-    var wlPreview = c.whitelist.length
-        ? c.whitelist.slice(0, 3).join("、") + (c.whitelist.length > 3 ? " …" : "")
-        : "未设置";
-    var wlCard = buildConfigRow("基金白名单", "仅白名单内基金可交易",
-        c.whitelist.length + " 只 · " + wlPreview, "#8b857b",
-        function () {
-            rawInputAsync("白名单基金名称(逗号分隔)", c.whitelist.join(","), function (s) {
-                if (s != null) {
-                    var arr = s.split(",").map(function (x) { return x.trim(); }).filter(Boolean);
-                    saveTradeConfig({ whitelist: arr });
-                    toast("白名单已存 " + arr.length + " 只");
-                }
-                ui.post(function () { renderConfig(); });
-            });
-        });
-    body.addView(wlCard);
-
-    // 3. 单笔上限
+    // 2. 单笔上限
     var maxCard = buildConfigRow("单笔金额上限", "超过此金额的交易将被拒绝",
         c.maxAmount + " 元", "#1c1a17",
         function () {
@@ -316,7 +469,7 @@ function renderConfig() {
         });
     body.addView(maxCard);
 
-    // 4. 二次确认阈值
+    // 3. 二次确认阈值
     var thrCard = buildConfigRow("二次确认阈值", "超过此金额需弹窗确认",
         c.confirmThreshold + " 元", "#1c1a17",
         function () {
@@ -330,130 +483,95 @@ function renderConfig() {
     // —— 运行模式 ——
     body.addView(buildConfigSection("运行模式"));
 
-    // 5. dry-run 开关
-    var dryCard = buildConfigRow("dry-run 演练", "开:走到密码页前停止,不真实下单",
-        c.dryRun ? "开 · 演练" : "关 · 真实下单", c.dryRun ? "#2e8b57" : "#c0392b",
+    // 4. 模拟运行开关(原 dry-run):开=走到密码页前停止不真实下单,关=真实下单
+    var dryCard = buildConfigRow("模拟运行（不下单）", "开:走到密码页前停止,不真实下单",
+        c.dryRun ? "开 · 模拟" : "关 · 真实", c.dryRun ? "#2e8b57" : "#c0392b",
         function () {
             var next = !c.dryRun;
             saveTradeConfig({ dryRun: next });
-            toast("dry-run " + (next ? "开" : "关"));
+            toast("模拟运行 " + (next ? "开（不下单）" : "关（真实下单）"));
             ui.post(function () { renderConfig(); });
         });
     body.addView(dryCard);
 
-    // —— 测试 ——
-    body.addView(buildConfigSection("dry-run 测试"));
+    // —— 组别(定投用;可复用基金集合,"全部"为默认组)——
+    body.addView(buildConfigSection("基金组别 · 定投作用范围"));
+    body.addView(buildGroupManager(c));
 
-    // 6. 测试买入
-    var buyCard = buildConfigRow("测试买入", "10 元 · 按 dryRun 配置 · 须在白名单",
+    // —— 单只测试(原 dry-run 测试)——
+    body.addView(buildConfigSection("单只测试"));
+
+    var buyCard = buildConfigRow("测试买入", "10 元 · 按上方模拟开关",
         "▶ 执行", "#8b857b",
         function () {
-            rawInputAsync("基金名称(完整,须在白名单)", "", function (fn) {
-                if (fn) runBuy(fn, 10);
-            });
+            pickFundName(function (fn) { if (fn) runBuy(fn, 10); });
         });
     body.addView(buyCard);
 
-    // 7. 测试卖出
-    var sellCard = buildConfigRow("测试卖出", "1 份 · 按 dryRun 配置 · 须在白名单",
+    var sellCard = buildConfigRow("测试卖出", "1 份 · 按上方模拟开关",
         "▶ 执行", "#8b857b",
         function () {
-            rawInputAsync("基金名称(完整,须在白名单)", "", function (fn) {
-                if (fn) runSell(fn, 1);
-            });
+            pickFundName(function (fn) { if (fn) runSell(fn, 1); });
         });
     body.addView(sellCard);
 
-    // —— 策略池(四套模板,入池才跑;长按切换入池,点击配参数)——
-    body.addView(buildConfigSection("策略池 · 入池的模板才执行"));
+    // —— 策略池(四种,启用的才执行)——
+    body.addView(buildConfigSection("策略 · 启用的才执行"));
 
     var S = c.strategies;
-    body.addView(buildStrategyCard("底仓", "持仓金额 < 目标时买一笔(元)",
-        "目标 " + S.base.target + " 元 · 单次 " + S.base.amount + " 元", S.base.inPool, function (inPool) {
-            saveStrategy('base', { inPool: inPool });
-        }, function () {  // 点参数
-            rawInputAsync("目标持仓 / 单次金额(逗号分隔)", S.base.target + "," + S.base.amount, function (s) {
-                var p = s.split(',').map(function (x) { return +x; });
-                if (p.length === 2 && p[0] > 0 && p[1] >= 1) saveStrategy('base', { target: p[0], amount: p[1] });
-                ui.post(function () { renderConfig(); });
-            });
-        }));
-
-    body.addView(buildStrategyCard("定投", "白名单内基金直接买一笔(元)",
-        "单次 " + S.dca.amount + " 元 · 白名单 " + S.dca.whitelist.length + " 只", S.dca.inPool, function (inPool) {
-            saveStrategy('dca', { inPool: inPool });
-        }, function () {
-            rawInputAsync("单次金额(元) / 白名单(逗号分隔,用 | 隔开)", S.dca.amount + " | " + S.dca.whitelist.join(","), function (s) {
-                var p = ('' + s).split('|');
-                var amt = +(p[0] || '').trim();
-                var wl = (p[1] || '').split(',').map(function (x) { return x.trim(); }).filter(Boolean);
-                if (amt >= 1) saveStrategy('dca', { amount: amt, whitelist: wl });
-                ui.post(function () { renderConfig(); });
-            });
-        }));
-
-    body.addView(buildStrategyCard("降本", "亏损时买入,按亏损档位加码(元)",
-        S.costReduce.tiers.map(function (t) { return (t.maxLoss * 100) + "%内→" + t.amount + "元"; }).join(" / "), S.costReduce.inPool, function (inPool) {
-            saveStrategy('costReduce', { inPool: inPool });
-        }, function () {
-            rawInputAsync("档位(亏损%:金额,逗号分隔;如 5:10,10:20)", S.costReduce.tiers.map(function (t) { return (t.maxLoss * 100) + ":" + t.amount; }).join(","), function (s) {
-                var tiers = [];
-                s.split(',').forEach(function (x) { var p = x.split(':'); if (p.length === 2) tiers.push({ maxLoss: +p[0] / 100, amount: +p[1] }); });
-                if (tiers.length) saveStrategy('costReduce', { tiers: tiers });
-                ui.post(function () { renderConfig(); });
-            });
-        }));
-
-    body.addView(buildStrategyCard("止盈", "收益率达档位卖等比份额(份)",
-        S.takeProfit.tiers.map(function (t) { return (t.minRate * 100) + "%→1/" + t.ratio; }).join(" / "), S.takeProfit.inPool, function (inPool) {
-            saveStrategy('takeProfit', { inPool: inPool });
-        }, function () {
-            rawInputAsync("档位(收益%:分母,逗号分隔;如 10:8,15:7,20:6,25:5,30:4,35:3,40:2,45:1)",
-                S.takeProfit.tiers.map(function (t) { return (t.minRate * 100) + ":" + t.ratio; }).join(","), function (s) {
-                    var tiers = [];
-                    s.split(',').forEach(function (x) { var p = x.split(':'); if (p.length === 2) tiers.push({ minRate: +p[0] / 100, ratio: +p[1] }); });
-                    if (tiers.length) saveStrategy('takeProfit', { tiers: tiers });
+    body.addView(buildStrategyCard("底仓", "持仓金额 < 目标时买一笔(全局)",
+        "目标 " + S.base.target + " 元 · 单次 " + S.base.amount + " 元", S.base.enabled, function (en) {
+            saveStrategy('base', { enabled: en });
+        }, function () {  // 点参数:目标 → 单次金额(连续两个单数值,零逗号)
+            rawInputAsync("目标持仓(元)", "" + S.base.target, function (t) {
+                if (!t || isNaN(+t) || +t <= 0) { ui.post(function () { renderConfig(); }); return; }
+                var tgt = +t;
+                rawInputAsync("单次金额(元)", "" + S.base.amount, function (a) {
+                    if (a && !isNaN(+a) && +a >= 1) saveStrategy('base', { target: tgt, amount: +a });
                     ui.post(function () { renderConfig(); });
                 });
+            });
         }));
 
-    // —— 立即执行 + 定时器 ——
+    // 定投:组别级金额(全部基金 + 各自定义组各自开关金额)
+    var dcaGrpN = (c.groups || []).filter(function (g) { return g.dcaEnabled; }).length;
+    body.addView(buildStrategyCard("定投", "每组各设金额,开关开的组内每只各买一笔",
+        (S.dca.allEnabled ? "全部:" + S.dca.allAmount + "元 ✓" : "全部:关") + " · " + dcaGrpN + " 组启用", S.dca.enabled, function (en) {
+            saveStrategy('dca', { enabled: en });
+        }, function () { editDca(S.dca, c.groups); }));
+
+    body.addView(buildStrategyCard("降本", "亏损时买入,按亏损档位加码(全局)",
+        S.costReduce.tiers.map(function (t) { return (t.maxLoss * 100) + "%内→" + t.amount + "元"; }).join(" / ") || "无档位", S.costReduce.enabled, function (en) {
+            saveStrategy('costReduce', { enabled: en });
+        }, function () {
+            editTiers("降本档位", S.costReduce.tiers,
+                [{ k: 'maxLoss', label: '亏损%', scale: 100 }, { k: 'amount', label: '金额(元)' }],
+                function (tiers) { saveStrategy('costReduce', { tiers: tiers }); });
+        }));
+
+    body.addView(buildStrategyCard("止盈", "收益率达档位卖等比份额(全局)",
+        S.takeProfit.tiers.map(function (t) { return (t.minRate * 100) + "%→1/" + t.ratio; }).join(" / ") || "无档位", S.takeProfit.enabled, function (en) {
+            saveStrategy('takeProfit', { enabled: en });
+        }, function () {
+            editTiers("止盈档位", S.takeProfit.tiers,
+                [{ k: 'minRate', label: '收益%', scale: 100 }, { k: 'ratio', label: '分母(卖 1/N)' }],
+                function (tiers) { saveStrategy('takeProfit', { tiers: tiers }); });
+        }));
+
+    // —— 立即执行 ——
     body.addView(buildConfigSection("执行"));
 
-    var execCard = buildConfigRow("立即执行策略", "扫描全部基金,池内策略买卖一遍",
-        "▶ " + (c.dryRun ? "演练" : "真实"), c.dryRun ? "#2e8b57" : "#c0392b",
+    var execCard = buildConfigRow("立即执行策略", "扫描全部基金,启用的策略买卖一遍",
+        "▶ " + (c.dryRun ? "模拟" : "真实"), c.dryRun ? "#2e8b57" : "#c0392b",
         function () {
             if (!secretStore.has() && !c.dryRun) { toast("未设置支付密码,无法真实下单"); return; }
             runStrategy();
         });
     body.addView(execCard);
 
-    var timerCard = buildConfigRow("定时触发", "脚本常驻前台时按间隔自动执行",
-        (c.timer.enabled ? "开 · 每 " + c.timer.intervalMin + " 分钟" : "关"), c.timer.enabled ? "#2e8b57" : "#8b857b",
-        function () {
-            rawInputAsync("定时间隔(分钟)", "" + c.timer.intervalMin, function (m) {
-                if (m && !isNaN(+m) && +m >= 1) {
-                    saveTradeConfig({ timer: { enabled: true, intervalMin: +m } });
-                    startTimer();
-                    toast("定时已开,每 " + m + " 分钟");
-                }
-                ui.post(function () { renderConfig(); });
-            });
-        });
-    body.addView(timerCard);
-    var timerOffCard = buildConfigRow("关闭定时", "停止定时触发",
-        c.timer.enabled ? "▶ 关闭" : "已关", c.timer.enabled ? "#c0392b" : "#b8b1a6",
-        function () {
-            saveTradeConfig({ timer: { enabled: false, intervalMin: c.timer.intervalMin } });
-            startTimer();
-            toast("定时已关");
-            ui.post(function () { renderConfig(); });
-        });
-    if (c.timer.enabled) body.addView(timerOffCard);
-
     // 页脚说明
     var foot = ui.inflate(
-        <text text="配置存储于本地 storages · 密码经 Android Keystore 加密&#10;点策略卡配参数 · 点右侧「在池/未入池」切换入池"
+        <text text="配置存储于本地 storages · 密码经 Android Keystore 加密&#10;点策略卡配参数 · 点右侧「启用/停用」切换"
             textColor="#b8b1a6" textSize="11sp" gravity="center" padding="0 20" />);
     body.addView(foot);
 }
@@ -465,9 +583,9 @@ function saveStrategy(key, patch) {
     cfgStore.put('strategies.' + key, s);
 }
 
-// 策略卡片:左标签+参数概览,右入池开关(独立可点)。点卡片=配参数,点右侧开关=切换入池。
+// 策略卡片:左标签+参数概览,右启用开关(独立可点)。点卡片=配参数,点右侧开关=切换启用。
 // 不用 longClick(设备差异大,常被识别成 click),改用独立开关 chip,交互稳定。
-function buildStrategyCard(label, sub, paramText, inPool, onToggle, onEdit) {
+function buildStrategyCard(label, sub, paramText, enabled, onToggle, onEdit) {
     var row = ui.inflate(
         <vertical bg="#fffdf8" padding="14 13" margin="0 0 0 8">
             <horizontal gravity="center_vertical">
@@ -479,15 +597,15 @@ function buildStrategyCard(label, sub, paramText, inPool, onToggle, onEdit) {
                 <text id="pool" textSize="12sp" textStyle="bold" padding="11 7" />
             </horizontal>
         </vertical>);
-    row.setBackground(roundRect(inPool ? "#efe9dc" : "#fffdf8", 12, inPool ? "#1c1a17" : "#e7e1d4", inPool ? 2 : 1));
-    row.lab.setText(label + (inPool ? " ✓" : ""));
+    row.setBackground(roundRect(enabled ? "#efe9dc" : "#fffdf8", 12, enabled ? "#1c1a17" : "#e7e1d4", enabled ? 2 : 1));
+    row.lab.setText(label + (enabled ? " ✓" : ""));
     row.sub.setText(sub);
     row.prm.setText(paramText);
-    row.pool.setText(inPool ? "在池" : "未入池");
-    row.pool.setBackground(roundRect(inPool ? "#1c1a17" : "#f0ebe0", 10, null, 0));
-    row.pool.setTextColor(COL(inPool ? "#fffdf8" : "#8b857b"));
+    row.pool.setText(enabled ? "启用" : "停用");
+    row.pool.setBackground(roundRect(enabled ? "#1c1a17" : "#f0ebe0", 10, null, 0));
+    row.pool.setTextColor(COL(enabled ? "#fffdf8" : "#8b857b"));
     row.info.on("click", function () { row.info.setAlpha(0.6); onEdit(); });
-    row.pool.on("click", function () { onToggle(!inPool); toast(label + (inPool ? " 移出池" : " 入池")); ui.post(function () { renderConfig(); }); });
+    row.pool.on("click", function () { onToggle(!enabled); toast(label + (enabled ? " 停用" : " 启用")); ui.post(function () { renderConfig(); }); });
     return row;
 }
 
@@ -496,6 +614,305 @@ function buildConfigSection(label) {
     var s = ui.inflate(<text id="lab" textSize="11sp" textStyle="bold" textColor="#b8b1a6" padding="4 14 0 6" margin="0 4 0 0" />);
     s.lab.setText(label);
     return s;
+}
+
+// 已采集基金名列表(供选择;未采集则提示)
+function availableFunds() {
+    var d = loadData();
+    return (d && d.funds) ? d.funds.map(function (f) { return f.name; }) : [];
+}
+
+// 选基金(select,零手敲)。无数据提示先采集。
+function pickFundName(cb) {
+    var names = availableFunds();
+    if (!names.length) { toast("请先采集基金数据"); cb(null); return; }
+    selectAsync("选择基金", names, function (i) {
+        cb(i >= 0 ? names[i] : null);
+    });
+}
+
+// 生成组别 id(时间戳基;脚本内不能用 Date.now() 的限制仅限 workflow,运行时可)
+function genId() { return 'g_' + new Date().getTime().toString(36) + Math.floor(Math.random() * 1000).toString(36); }
+
+// ===== 首页基金卡片操作(逐只基金添加/交易)=====
+
+// 加入组别:select 已有组 + 「+新建组别」。逐只加入,组别添加的主入口在首页。
+function addToGroup(fundName) {
+    var c = loadTradeConfig();
+    var groups = c.groups || [];
+    var opts = groups.map(function (g) { return g.name; });
+    opts.push("+ 新建组别");
+    opts.push("取消");
+    selectAsync("把「" + fundName + "」加入组别", opts, function (idx) {
+        if (idx == null || idx < 0 || idx === opts.length - 1) return;  // 取消
+        if (idx === opts.length - 2) {  // 新建组别
+            rawInputAsync("新组别名称", "组" + (groups.length + 1), function (nm) {
+                var name = (nm || "").trim() || ("组" + (groups.length + 1));
+                groups.push({ id: genId(), name: name, funds: [fundName], dcaEnabled: false, dcaAmount: 100 });
+                saveTradeConfig({ groups: groups });
+                toast("已新建「" + name + "」并加入 " + fundName);
+            });
+        } else {  // 已有组
+            var g = groups[idx];
+            if (g.funds.indexOf(fundName) >= 0) { toast(fundName + " 已在该组"); return; }
+            g.funds.push(fundName);
+            saveTradeConfig({ groups: groups });
+            toast("已加入「" + g.name + "」");
+        }
+    });
+}
+
+// 设为定投(首页入口):定投金额在组别上,这里选/建一个组并设该组定投开关+金额。
+function setupDca(fundName) {
+    var c = loadTradeConfig();
+    var groups = c.groups || [];
+    var opts = groups.map(function (g) { return g.name; });
+    opts.unshift("全部基金");
+    opts.push("+ 新建组别");
+    opts.push("取消");
+    selectAsync("把「" + fundName + "」定投到", opts, function (idx) {
+        if (idx == null || idx < 0 || idx === opts.length - 1) return;  // 取消
+        if (idx === opts.length - 2) {  // 新建组别
+            rawInputAsync("新组别名称", "组" + (groups.length + 1), function (nm) {
+                var name = (nm || "").trim() || ("组" + (groups.length + 1));
+                askDcaAmount(name, function (amt) {
+                    var g = { id: genId(), name: name, funds: [fundName], dcaEnabled: true, dcaAmount: amt };
+                    groups.push(g);
+                    saveTradeConfig({ groups: groups });
+                    toast("已新建「" + name + "」并开启定投 " + amt + " 元");
+                });
+            });
+        } else if (idx === 0) {  // 全部基金
+            askDcaAmount("全部基金", function (amt) {
+                saveStrategy('dca', { allEnabled: true, allAmount: amt });
+                toast("全部基金定投 " + amt + " 元已开启");
+            });
+        } else {  // 已有组(注意 unshift 后索引+1)
+            var g = groups[idx - 1];
+            if (g.funds.indexOf(fundName) < 0) g.funds.push(fundName);
+            askDcaAmount(g.name, function (amt) {
+                g.dcaEnabled = true; g.dcaAmount = amt;
+                saveTradeConfig({ groups: groups });
+                toast("「" + g.name + "」定投 " + amt + " 元已开启");
+            });
+        }
+    });
+}
+// 定投金额输入(共用),amt>=1 才回调
+function askDcaAmount(label, cb) {
+    rawInputAsync(label + " 定投金额(元)", "100", function (v) {
+        if (v == null || v === "" || isNaN(+v) || +v < 1) { toast("金额需 >=1"); return; }
+        cb(+v);
+    });
+}
+
+// 组别管理区(只读+调整):列出"全部"(只读)+ 各自定义组;点组进管理菜单。
+// 组别的"添加"在首页基金卡片「加入组」做,这里只查看/重命名/删基金/删组。
+function buildGroupManager(c) {
+    var wrap = ui.inflate(<vertical id="root" margin="0 0 0 8" />);
+    // "全部基金"只读行
+    var allRow = ui.inflate(
+        <vertical bg="#fffdf8" padding="14 12" margin="0 0 0 6">
+            <horizontal gravity="center_vertical">
+                <text text="全部基金" textSize="14sp" textStyle="bold" textColor="#1c1a17" layout_weight="1" />
+                <text text="默认 · 不可编辑" textSize="11sp" textColor="#b8b1a6" />
+            </horizontal>
+        </vertical>);
+    allRow.setBackground(roundRect("#fffdf8", 12, "#e7e1d4", 1));
+    wrap.root.addView(allRow);
+    // 自定义组
+    var groups = c.groups || [];
+    if (!groups.length) {
+        var tip = ui.inflate(
+            <vertical bg="#fffdf8" padding="14 12" margin="0 0 0 6">
+                <text text="暂无自定义组别" textSize="13sp" textColor="#8b857b" />
+                <text text="在首页点基金卡片「加入组」即可新建" textSize="11sp" textColor="#b8b1a6" margin="0 3 0 0" />
+            </vertical>);
+        tip.setBackground(roundRect("#fffdf8", 12, "#e7e1d4", 1));
+        wrap.root.addView(tip);
+    } else {
+        groups.forEach(function (g) {
+            var preview = (g.funds || []).slice(0, 3).join("、") + ((g.funds || []).length > 3 ? " …" : "");
+            var dcaTxt = g.dcaEnabled ? " · 定投 " + g.dcaAmount + "元" : "";
+            var row = buildConfigRow(g.name, (g.funds || []).length + " 只" + dcaTxt + " · " + (preview || "空"),
+                "✎ 管理", "#8b857b", function () { editGroupDetails(g, groups); });
+            wrap.root.addView(row);
+        });
+    }
+    return wrap.root;
+}
+
+// 组别详情管理:重命名 / 移除基金 / 定投开关+金额 / 删除组别。group 引用 groups 内对象,改后整体 saveTradeConfig。
+function editGroupDetails(group, groups) {
+    selectAsync("管理组别「" + group.name + "」", ["重命名", "移除基金", "定投:" + (group.dcaEnabled ? "开 " + group.dcaAmount + "元" : "关"), "删除组别", "取消"], function (ch) {
+        if (ch === 0) {
+            rawInputAsync("组别新名称", group.name, function (nm) {
+                var name = (nm || "").trim();
+                if (name) { group.name = name; saveTradeConfig({ groups: groups }); toast("已重命名为「" + name + "」"); }
+                ui.post(function () { renderConfig(); });
+            });
+        } else if (ch === 1) {
+            var funds = group.funds || [];
+            if (!funds.length) { toast("该组无基金"); ui.post(function () { renderConfig(); }); return; }
+            selectAsync("选择要移除的基金", funds.concat(["取消"]), function (fi) {
+                if (fi == null || fi < 0 || fi >= funds.length) { ui.post(function () { renderConfig(); }); return; }
+                var removed = funds[fi];
+                group.funds = funds.filter(function (n) { return n !== removed; });
+                saveTradeConfig({ groups: groups });
+                toast("已移除 " + removed);
+                ui.post(function () { renderConfig(); });
+            });
+        } else if (ch === 2) {  // 定投开关+金额
+            editDcaGroup(group, groups);
+        } else if (ch === 3) {
+            confirmAsync("删除组别", "删除「" + group.name + "」?组内基金不受影响。", function (ok) {
+                if (ok) {
+                    var gid = group.id;
+                    var c = loadTradeConfig();
+                    var newGroups = (c.groups || []).filter(function (x) { return x.id !== gid; });
+                    saveTradeConfig({ groups: newGroups });
+                    toast("已删除「" + group.name + "」");
+                    ui.post(function () { renderConfig(); });
+                } else {
+                    ui.post(function () { renderConfig(); });
+                }
+            });
+        } else {
+            ui.post(function () { renderConfig(); });
+        }
+    });
+}
+
+// 档位列表编辑器(降本/止盈共用)。fields 描述每档字段(连续两个单数值输入,零逗号)。
+// onDone(tiers):tiers 已按字段 scale 还原(如 maxLoss 5 → 0.05)
+function editTiers(title, tiers, fields, onDone) {
+    var list = tiers.map(function (t) { return JSON.parse(JSON.stringify(t)); });
+    function fmt(t) {
+        var a = fields[0], b = fields[1];
+        var av = t[a.k] * (a.scale || 1), bv = t[b.k];
+        return a.label + " " + (Math.round(av * 100) / 100) + " · " + b.label + " " + bv;
+    }
+    function readField(field, prefill, cb) {
+        rawInputAsync(field.label + "(" + (field.scale ? "输入整数" : "") + ")", "" + prefill, function (v) {
+            cb(v);
+        });
+    }
+    function addTier() {
+        var a = fields[0], b = fields[1];
+        readField(a, "5", function (va) {
+            if (va == null || va === "" || isNaN(+va)) { menu(); return; }
+            var av = +va / (a.scale || 1);
+            readField(b, a.k === 'maxLoss' ? "10" : "8", function (vb) {
+                if (vb != null && vb !== "" && !isNaN(+vb)) {
+                    var t = {}; t[a.k] = av; t[b.k] = +vb; list.push(t);
+                }
+                menu();
+            });
+        });
+    }
+    function editTier(idx) {
+        var a = fields[0], b = fields[1];
+        var t = list[idx];
+        readField(a, "" + (t[a.k] * (a.scale || 1)), function (va) {
+            if (va == null || va === "" || isNaN(+va)) { menu(); return; }
+            var av = +va / (a.scale || 1);
+            readField(b, "" + t[b.k], function (vb) {
+                if (vb != null && vb !== "" && !isNaN(+vb)) {
+                    t[a.k] = av; t[b.k] = +vb;
+                }
+                menu();
+            });
+        });
+    }
+    // 主菜单:列已有档位(选中可编辑/删除)+ 添加/完成/取消
+    function menu() {
+        var items = list.map(fmt);
+        items.push("+ 添加档位");
+        items.push("✓ 完成保存");
+        items.push("✕ 取消");
+        selectAsync(title + " · 共 " + list.length + " 档", items, function (idx) {
+            if (idx == null || idx < 0) { ui.post(function () { renderConfig(); }); return; }
+            if (idx < list.length) {
+                // 选中已有档:编辑 or 删除
+                selectAsync("档位:" + fmt(list[idx]), ["✎ 编辑", "🗑 删除", "← 返回"], function (ch) {
+                    if (ch === 0) editTier(idx);
+                    else if (ch === 1) { list.splice(idx, 1); menu(); }
+                    else menu();
+                });
+                return;
+            }
+            if (idx === list.length) { addTier(); return; }
+            if (idx === list.length + 1) {
+                var key0 = fields[0].k;
+                list.sort(function (x, y) { return x[key0] - y[key0]; });
+                if (list.length) onDone(list);
+                ui.post(function () { renderConfig(); });
+                return;
+            }
+            ui.post(function () { renderConfig(); });
+        });
+    };
+    menu();
+}
+
+// 定投编辑(组别级):全部基金开关+金额 / 各组开关+金额。组的添加在首页基金卡片「加入组」做。
+function editDca(dca, groups) {
+    var allLabel = "全部基金:" + (dca.allEnabled ? "开 " + dca.allAmount + "元" : "关");
+    var grpItems = (groups || []).map(function (g) {
+        return g.name + ":" + (g.dcaEnabled ? "开 " + g.dcaAmount + "元" : "关") + " · " + (g.funds || []).length + "只";
+    });
+    var items = [allLabel].concat(grpItems).concat(["取消"]);
+    selectAsync("定投管理 · 全部 + " + (groups || []).length + " 组", items, function (ch) {
+        if (ch == null || ch < 0 || ch === items.length - 1) { ui.post(function () { renderConfig(); }); return; }
+        if (ch === 0) {  // 全部基金定投
+            editDcaAll(dca);
+        } else {  // 某组定投(ch-1 为组索引)
+            editDcaGroup(groups[ch - 1], groups);
+        }
+    });
+}
+
+// 全部基金定投:开关 + 金额
+function editDcaAll(dca) {
+    selectAsync("全部基金定投(当前:" + (dca.allEnabled ? "开 " + dca.allAmount + "元" : "关") + ")",
+        ["开/关切换", "改金额", "取消"], function (ch) {
+            if (ch === 0) {
+                saveStrategy('dca', { allEnabled: !dca.allEnabled });
+                toast("全部基金定投 " + (!dca.allEnabled ? "开" : "关"));
+                ui.post(function () { renderConfig(); });
+            } else if (ch === 1) {
+                rawInputAsync("全部基金定投金额(元)", "" + dca.allAmount, function (v) {
+                    if (v != null && v !== "" && !isNaN(+v) && +v >= 1) {
+                        saveStrategy('dca', { allAmount: +v, allEnabled: true });
+                        toast("全部基金定投 " + (+v) + " 元已开启");
+                    }
+                    ui.post(function () { renderConfig(); });
+                });
+            } else { ui.post(function () { renderConfig(); }); }
+        });
+}
+
+// 某组定投:开关 + 金额(改后整体 saveTradeConfig groups)
+function editDcaGroup(group, groups) {
+    selectAsync("组别「" + group.name + "」定投(当前:" + (group.dcaEnabled ? "开 " + group.dcaAmount + "元" : "关") + ")",
+        ["开/关切换", "改金额", "取消"], function (ch) {
+            if (ch === 0) {
+                group.dcaEnabled = !group.dcaEnabled;
+                saveTradeConfig({ groups: groups });
+                toast("「" + group.name + "」定投 " + (group.dcaEnabled ? "开" : "关"));
+                ui.post(function () { renderConfig(); });
+            } else if (ch === 1) {
+                rawInputAsync("「" + group.name + "」定投金额(元)", "" + group.dcaAmount, function (v) {
+                    if (v != null && v !== "" && !isNaN(+v) && +v >= 1) {
+                        group.dcaAmount = +v;
+                        group.dcaEnabled = true;
+                        saveTradeConfig({ groups: groups });
+                        toast("「" + group.name + "」定投 " + (+v) + " 元已开启");
+                    }
+                    ui.post(function () { renderConfig(); });
+                });
+            } else { ui.post(function () { renderConfig(); }); }
+        });
 }
 
 // 配置行卡片:左标签+副标题,右当前值(整行可点)
@@ -542,8 +959,19 @@ function onLicaiPage() {
     return !!((text("稳健理财").findOne(600)) || (textContains("总资产(元)").findOne(500)));
 }
 function settle() { sleep(800); var prev = -1; for (var i = 0; i < 5; i++) { var n = -1; try { n = className("android.widget.TextView").find().size(); } catch (e) {} if (n > 0 && n === prev) break; prev = n; sleep(350); } }
+// 持有页判定:有"持有收益率" 且 没有「买入」按钮(详情页也有"持有收益率",但详情页有买入按钮,会误判)
+function onHoldPage(to) { return !!textContains("持有收益率").findOne(to || 500) && !text("买入").findOne(200); }
+// 点支付宝 H5(XRiver)详情页左上角返回按钮;比 back 可预测(back 可能退出支付宝)。返回是否点到。
+function tapBackBtn() {
+    var b = id("com.alipay.multiplatform.phone.xriver_integration:id/frameLayout_backButton").findOne(1500)
+        || id("com.alipay.multiplatform.phone.xriver_integration:id/auiconView_backButton").findOne(800);
+    if (!b) return false;
+    var bd = b.bounds();
+    click(Math.floor((bd.left + bd.right) / 2), Math.floor((bd.top + bd.bottom) / 2));
+    return true;
+}
 function openFundPage() {
-    if (textContains("持有收益率").findOne(800)) return;  // 已在持有列表,无需重新导航(连续买入第二次)
+    if (onHoldPage(800)) return;  // 已在持有列表,无需重新导航(连续买入第二次)
     if (!isInAlipay()) { try { app.launchPackage(PKG); } catch (e) {} if (!waitPkg(6000)) throw new Error("启动支付宝失败,请先手动打开支付宝"); }
     settle();
     for (var i = 0; i < 8; i++) {
@@ -627,31 +1055,17 @@ function tapRe(t) {
 function navToDetail(name) {
     openFundPage();
     for (var i = 0; i < 20; i++) { if (textContains("持有收益率").findOne(400)) break; sleep(500); }
-    var H = (typeof device !== "undefined" && device.height) ? device.height : 2400;
-    var pick = null, b = null, visible = false;
-    // 持有列表为 H5 可滚动;目标基金可能在窗口外,bounds 可能是内容坐标(top 很大)或异常(top>bot),滑动到可见再坐标 click
-    for (var page = 0; page < 12; page++) {
-        var col = className("android.widget.Button").find();
-        pick = null;
-        for (var i = 0; i < col.size(); i++) {
-            var t = (col.get(i).text() || "");
-            if (t.indexOf(name) >= 0 && /金额:.*昨日收益:/.test(t)) { pick = col.get(i); break; }
-        }
-        if (pick) {
-            b = pick.bounds();
-            // 可见:Rect 有效(top<bottom) 且 完全在屏幕内(留 50 边距)
-            visible = (b.top < b.bottom && b.top > 50 && b.bottom < H - 50);
-            if (visible) break;
-        }
-        swipe(540, Math.floor(H * 0.72), 540, Math.floor(H * 0.25), 500);  // 向上滑露出下方基金
-        sleep(1400);
+    // 持有列表为 H5;目标基金可能在窗口外,bounds 异常(top>bot 或超出屏幕),
+    // 但 accessibility click(node.click())对窗口外元素同样有效(verified-flows/02 实测),
+    // 故无需滑动到可见,直接找节点 click
+    var pick = null;
+    var col = className("android.widget.Button").find();
+    for (var i = 0; i < col.size(); i++) {
+        var t = (col.get(i).text() || "");
+        if (t.indexOf(name) >= 0 && /金额:.*昨日收益:/.test(t)) { pick = col.get(i); break; }
     }
     if (!pick) throw new Error("持有页未找到基金「" + name + "」");
-    if (visible) {
-        click(Math.floor((b.left + b.right) / 2), Math.floor((b.top + b.bottom) / 2));
-    } else {
-        pick.click();  // 兜底:accessibility click(不依赖可见)
-    }
+    pick.click();  // accessibility click,不依赖可见性
     sleep(3000);
     if (!text(UI.BTN_BUY).findOne(5000)) throw new Error("进详情页失败(未见「买入」)");
     return true;
@@ -679,29 +1093,56 @@ function pay(pwd) {
 // 回持有页(连续买卖/dry-run 退出时用):先连 back 试退支付页;back 退不掉(指纹页等)就启动支付宝重导航
 function backToHoldPage() {
     for (var i = 0; i < 4; i++) {
-        if (textContains("持有收益率").findOne(800)) { console.log("PAY 已回持有页"); return true; }
+        if (onHoldPage(800)) { console.log("PAY 已回持有页"); return true; }
         back(); sleep(1000);
     }
-    if (textContains("持有收益率").findOne(800)) return true;
+    if (onHoldPage(800)) return true;
     // back 退不回去(指纹页/确认对话框卡住),启动支付宝重新导航到持有页
     console.log("PAY back 退不回,launchPackage 重进");
     try { app.launchPackage(PKG); } catch (e) {}
     if (!waitPkg(7000)) return false;
     sleep(1500);
     for (var j = 0; j < 8; j++) {
-        if (textContains("持有收益率").findOne(800)) return true;
-        if (onLicaiPage()) { tapSmart("基金"); sleep(WAIT); settle(); tapSmart("持有"); sleep(LOAD_WAIT); settle(); return !!textContains("持有收益率").findOne(1500); }
+        if (onHoldPage(800)) return true;
+        if (onLicaiPage()) { tapSmart("基金"); sleep(WAIT); settle(); tapSmart("持有"); sleep(LOAD_WAIT); settle(); return onHoldPage(1500); }
         back(); sleep(1200);
         if (!isInAlipay()) { try { app.launchPackage(PKG); } catch (e) {} waitPkg(4000); }
     }
-    return !!textContains("持有收益率").findOne(1000);
+    return onHoldPage(1000);
+}
+
+// dry-run 退出:点"使用密码"展开密码弹窗 → 点 closeimg 关闭密码键盘 → 显式点详情页返回按钮回持有页
+// 密码页是原生 Activity(非 XRiver H5),关闭按钮靠 id 不靠 text:
+//   指纹页: id=.../close (desc=取消);密码键盘页: id=.../closeimg (ImageView,无text)
+function closePwdAndBack() {
+    // 1. 点"使用密码"切到数字键盘(与 pay() 一致的找法)
+    var usePwd = text("使用密码").findOne(3000) || textContains("使用密码").findOne(2000);
+    if (usePwd) { try { usePwd.click(); } catch (e) { var ub = usePwd.bounds(); click(Math.floor((ub.left + ub.right) / 2), Math.floor((ub.top + ub.bottom) / 2)); } sleep(1200); }
+    // 2. 点密码弹窗关闭按钮(按 id:密码键盘页 closeimg,或指纹页 close;坐标点击兜底)
+    var closeBtn = id("com.alipay.android.phone.mobilecommon.verifyidentity:id/closeimg").findOne(2000)
+        || id("com.alipay.android.phone.seauthenticator.iotauth:id/close").findOne(1500);
+    if (closeBtn) {
+        try { closeBtn.click(); }
+        catch (e) { var cb = closeBtn.bounds(); click(Math.floor((cb.left + cb.right) / 2), Math.floor((cb.top + cb.bottom) / 2)); }
+        sleep(1000);
+    }
+    // 3. 已回持有页则无需再退
+    if (onHoldPage(800)) return;
+    // 4. 显式点 XRiver 返回按钮逐层退出(详情页→持有页),最多点 3 次;每次点完等页面 settle
+    for (var i = 0; i < 3; i++) {
+        if (!tapBackBtn()) break;  // 找不到返回按钮(非详情页/已退出 H5),交给 backToHoldPage 兜底
+        sleep(1200);
+        if (onHoldPage(800)) return;
+    }
+    // 5. 仍未回持有页,用 launchPackage 重导航兜底
+    backToHoldPage();
 }
 
 // 买入(o:{code,name,amount,dryRun})
 function buy(o) {
     var cfg = loadTradeConfig();
     var dry = o.dryRun != null ? o.dryRun : cfg.dryRun;
-    var g = checkGuard({ name: o.name, amount: o.amount, whitelist: cfg.whitelist, maxAmount: cfg.maxAmount, confirmThreshold: cfg.confirmThreshold });
+    var g = checkGuard({ name: o.name, amount: o.amount, maxAmount: cfg.maxAmount, confirmThreshold: cfg.confirmThreshold });
     if (!g.ok) return { ok: false, status: "rejected", msg: g.reason };
     if (g.needConfirm) {
         var ok = dialogs.confirm("大额确认", "买入 " + o.name + " " + o.amount + " 元?");
@@ -730,14 +1171,19 @@ function buy(o) {
         // 支付确认页检测:密码页/指纹页/验证身份页都算"到达支付前"(dry-run 在此停)
         for (var i = 0; i < 3; i++) {
             if (textContains("密码").findOne(1500) || textContains("指纹").findOne(800) || textContains("验证身份").findOne(800) || textContains("验证指纹").findOne(800)) break;
+            // 协议勾选(可选):部分基金首次买入/卖出需先勾选协议才会生效。
+            // 判据——界面出现「请勾选」提示才点协议框;无提示=已勾选/不需要,跳过(不误点取消)
+            if (text("请勾选").findOne(600)) {
+                var agree = textContains("点击确定代表您知悉").findOne(1200) || textContains("知悉产品概要").findOne(800);
+                if (agree) { try { agree.click(); } catch (e) {} sleep(700); console.log("TRADE 勾选协议"); }
+            }
             if (textMatches(UI.BTN_CONFIRM).findOne(800)) { tapRe(UI.BTN_CONFIRM); sleep(1800); }
         }
-        status(dry ? "dry-run 停在密码页" : "密码页,输入密码…");
+        status(dry ? "模拟：停在密码页" : "密码页,输入密码…");
         if (dry) {
-            // dry-run:连 back 退支付页,退不掉就启动支付宝重进持有页(指纹页 back 常无效,靠 launchPackage 兜底)
-            for (var bi = 0; bi < 4; bi++) { back(); sleep(700); if (textContains("持有收益率").findOne(600)) break; }
-            backToHoldPage();
-            audit.status = "dry_run_stopped_at_pwd"; audit.msg = "dry-run 到密码页前停止";
+            // dry-run:走"使用密码→关闭→back2"退出路径(模拟真实下单退出,不卡指纹页),backToHoldPage 最终兜底
+            closePwdAndBack();
+            audit.status = "dry_run_stopped_at_pwd"; audit.msg = "模拟：到密码页前停止";
             appendAudit(buildAudit(audit)); return { ok: true, status: audit.status, msg: audit.msg };
         }
         var pin = secretStore.get();
@@ -784,7 +1230,6 @@ function sell(o) {
     var cfg = loadTradeConfig();
     var dry = o.dryRun != null ? o.dryRun : cfg.dryRun;
     if (!o.shares && !o.ratio) return { ok: false, status: "rejected", msg: "需指定 shares 或 ratio" };
-    if (cfg.whitelist.length > 0 && cfg.whitelist.indexOf(o.name) < 0) return { ok: false, status: "rejected", msg: "基金不在白名单" };
     var audit = { ts: new Date().getTime(), action: "sell", code: o.code || "", name: o.name, shares: o.shares, dryRun: dry };
     try {
         status("进详情:" + o.name);
@@ -823,14 +1268,19 @@ function sell(o) {
         // 支付确认页检测:密码页/指纹页/验证身份页都算"到达支付前"(dry-run 在此停)
         for (var i = 0; i < 3; i++) {
             if (textContains("密码").findOne(1500) || textContains("指纹").findOne(800) || textContains("验证身份").findOne(800) || textContains("验证指纹").findOne(800)) break;
+            // 协议勾选(可选):部分基金首次买入/卖出需先勾选协议才会生效。
+            // 判据——界面出现「请勾选」提示才点协议框;无提示=已勾选/不需要,跳过(不误点取消)
+            if (text("请勾选").findOne(600)) {
+                var agree = textContains("点击确定代表您知悉").findOne(1200) || textContains("知悉产品概要").findOne(800);
+                if (agree) { try { agree.click(); } catch (e) {} sleep(700); console.log("TRADE 勾选协议"); }
+            }
             if (textMatches(UI.BTN_CONFIRM).findOne(800)) { tapRe(UI.BTN_CONFIRM); sleep(1800); }
         }
-        status(dry ? "dry-run 停在密码页" : "密码页,输入密码…");
+        status(dry ? "模拟：停在密码页" : "密码页,输入密码…");
         if (dry) {
-            // dry-run:连 back 退支付页,退不掉就启动支付宝重进持有页(指纹页 back 常无效,靠 launchPackage 兜底)
-            for (var bi = 0; bi < 4; bi++) { back(); sleep(700); if (textContains("持有收益率").findOne(600)) break; }
-            backToHoldPage();
-            audit.status = "dry_run_stopped_at_pwd"; audit.msg = "dry-run 到密码页前停止";
+            // dry-run:走"使用密码→关闭→back2"退出路径(模拟真实下单退出,不卡指纹页),backToHoldPage 最终兜底
+            closePwdAndBack();
+            audit.status = "dry_run_stopped_at_pwd"; audit.msg = "模拟：到密码页前停止";
             appendAudit(buildAudit(audit)); return { ok: true, status: audit.status, msg: audit.msg };
         }
         var pin = secretStore.get();
@@ -884,8 +1334,8 @@ function runStrategy() {
             // 1. 采集
             status("采集中…");
             var data = collectFunds();
-            // 2. 生成计划(只对池内模板)
-            var buys = planBuys(data.funds, cfg.strategies);
+            // 2. 生成计划(只对启用的模板)
+            var buys = planBuys(data.funds, cfg.strategies, cfg.groups);
             var sells = planSells(data.funds, cfg.strategies);
             summary.buy = buys.length; summary.sell = sells.length;
             status("计划:买 " + buys.length + " 笔 / 卖 " + sells.length + " 笔");
@@ -922,34 +1372,28 @@ function runStrategy() {
     });
 }
 
-// ---------- 定时器(脚本常驻前台 setInterval,HyperOS 后台不可靠)----------
-var timerHandle = null;
-function startTimer() {
-    var cfg = loadTradeConfig();
-    if (timerHandle) { clearInterval(timerHandle); timerHandle = null; }
-    if (!cfg.timer || !cfg.timer.enabled) return;
-    var ms = (cfg.timer.intervalMin || 60) * 60 * 1000;
-    timerHandle = setInterval(function () { runStrategy(); }, ms);
-    console.log("TIMER 已启动,每 " + cfg.timer.intervalMin + " 分钟触发");
-}
-
 // ---------- UI ----------
 ui.layout(
-    <vertical bg="#f6f4ef">
-        <horizontal bg="#fffdf8" padding="16 14" gravity="center_vertical">
-            <vertical layout_weight="1">
-                <text text="支付宝 · 基金持仓" textColor="#1c1a17" textSize="15sp" textStyle="bold" />
-                <text id="meta" text="点右上角刷新按钮获取数据" textColor="#8b857b" textSize="11sp" />
-            </vertical>
-            <button id="cfg" w="44" h="44" text="⚙" textColor="#1c1a17" textSize="22sp" gravity="center" />
-            <button id="btn" w="44" h="44" text="↻" textColor="#1c1a17" textSize="24sp" gravity="center" />
-        </horizontal>
-        <scroll layout_weight="1">
-            <vertical id="body" padding="14">
-                <text text="还没有数据&#10;点右上角刷新按钮采集" textColor="#8b857b" textSize="14sp" gravity="center" padding="0 80" />
-            </vertical>
-        </scroll>
-    </vertical>
+    <frame bg="#f6f4ef">
+        <vertical bg="#f6f4ef">
+            <horizontal bg="#fffdf8" padding="16 14" gravity="center_vertical">
+                <vertical layout_weight="1">
+                    <text text="支付宝 · 基金持仓" textColor="#1c1a17" textSize="15sp" textStyle="bold" />
+                    <text id="meta" text="点右上角刷新按钮获取数据" textColor="#8b857b" textSize="11sp" />
+                </vertical>
+                <button id="cfg" w="44" h="44" text="⚙" textColor="#1c1a17" textSize="22sp" gravity="center" />
+                <button id="btn" w="44" h="44" text="↻" textColor="#1c1a17" textSize="24sp" gravity="center" />
+            </horizontal>
+            <scroll layout_weight="1">
+                <vertical id="body" padding="14">
+                    <text text="还没有数据&#10;点右上角刷新按钮采集" textColor="#8b857b" textSize="14sp" gravity="center" padding="0 80" />
+                </vertical>
+            </scroll>
+        </vertical>
+        <vertical id="overlay" bg="#80000000" visibility="gone" gravity="center" padding="24">
+            <vertical id="overlayCard" bg="#fffdf8" padding="4" />
+        </vertical>
+    </frame>
 );
 
 // 刷新按钮:纯图标(透明背景,完全融入 header)
@@ -1022,6 +1466,12 @@ function renderList(d) {
                         <text id="yest" layout_weight="1" textSize="11sp" />
                         <text id="hold" textSize="11sp" />
                     </horizontal>
+                    <horizontal margin="0 10 0 0" gravity="center_vertical">
+                        <text id="actGrp" layout_weight="1" gravity="center" textSize="11sp" textStyle="bold" padding="0 8" />
+                        <text id="actDca" layout_weight="1" gravity="center" textSize="11sp" textStyle="bold" padding="0 8" margin="6 0 0 0" />
+                        <text id="actBuy" layout_weight="1" gravity="center" textSize="11sp" textStyle="bold" padding="0 8" margin="6 0 0 0" />
+                        <text id="actSell" layout_weight="1" gravity="center" textSize="11sp" textStyle="bold" padding="0 8" margin="6 0 0 0" />
+                    </horizontal>
                 </vertical>);
             card.setBackground(roundRect("#fffdf8", 12, "#e7e1d4", 1));
             card.nm.setText(f.name);
@@ -1030,12 +1480,31 @@ function renderList(d) {
             card.rt.setText(pct(f.rate)); card.rt.setTextColor(COL(hexOf(f.rate)));
             card.yest.setText("昨日 " + signed(f.yesterday)); card.yest.setTextColor(COL(hexOf(f.yesterday)));
             card.hold.setText("持有 " + signed(f.holding)); card.hold.setTextColor(COL(hexOf(f.holding)));
+            // 操作按钮条(纸面描边圆角,等分四格)
+            var btnStyle = function (v) { v.setBackground(roundRect("#fffdf8", 9, "#e7e1d4", 1)); v.setTextColor(COL("#6a645a")); };
+            card.actGrp.setText("加入组"); btnStyle(card.actGrp);
+            card.actDca.setText("定投"); btnStyle(card.actDca);
+            card.actBuy.setText("买"); btnStyle(card.actBuy);
+            card.actSell.setText("卖"); btnStyle(card.actSell);
+            var fn = f.name;
+            card.actGrp.on("click", function () { addToGroup(fn); });
+            card.actDca.on("click", function () { setupDca(fn); });
+            card.actBuy.on("click", function () {
+                rawInputAsync(fn + " 买入金额(元)", "10", function (v) {
+                    if (v && !isNaN(+v) && +v >= 1) runBuy(fn, +v);
+                });
+            });
+            card.actSell.on("click", function () {
+                rawInputAsync(fn + " 卖出份额(份)", "1", function (v) {
+                    if (v && !isNaN(+v) && +v >= 1) runSell(fn, +v);
+                });
+            });
             uiList.addView(card);
         });
     }
     var sum = rows.reduce(function (a, f) { return a + (f.amount || 0); }, 0);
     uiFoot.setText("共 " + d.funds.length + " 只 · 显示 " + rows.length + " 只 · 合计 " + money(sum) +
-        "\n数据来源:支付宝「基金·持有」页 · 只读,不涉及交易");
+        "\n点卡片按钮:加入组 / 定投 / 买卖");
 }
 
 function render(d) {
@@ -1110,6 +1579,3 @@ ui.btn.on("click", function () {
 
 // 设置按钮 = 交易配置
 ui.cfg.on("click", function () { openConfigUI(); });
-
-// 启动时恢复定时器(脚本常驻前台才有效)
-startTimer();
