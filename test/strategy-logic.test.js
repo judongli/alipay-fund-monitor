@@ -306,4 +306,34 @@ assert.strictEqual(planSells([{ name: 'X', rate: 0.25 }], STpAll).length, 0);
 var STpLegacy = { takeProfit: { enabled: true, tiers: [{ minRate: 0.10, ratio: 8 }, { minRate: 0.20, ratio: 6 }] } };
 assert.strictEqual(planSells([{ name: 'X', rate: 0.25 }], STpLegacy)[0].ratio, 1 / 6);
 
+// ---- 降本档位启用开关:关掉的档视为不存在,取最浅启用命中档 ----
+// 关最浅 5% 档 → 小亏损(-4%)回退到 10% 档(20 元)
+var SCrSw = { base: { enabled: false }, dca: { enabled: false },
+    costReduce: { enabled: true, tiers: [
+        { maxLoss: 0.05, amount: 10, enabled: false }, { maxLoss: 0.10, amount: 20 },
+    ], catchAll: { enabled: false, amount: 30 } } };
+assert.strictEqual(planBuys([{ name: 'X', amount: 500, rate: -0.04 }], SCrSw, [])[0].amount, 20);
+// 关中间档(10%) → rate=-0.10 本应命中 10%(20),禁用后取更深启用 15% 档(30)
+var SCrMid = { base: { enabled: false }, dca: { enabled: false },
+    costReduce: { enabled: true, tiers: [
+        { maxLoss: 0.05, amount: 10 }, { maxLoss: 0.10, amount: 20, enabled: false }, { maxLoss: 0.15, amount: 30 },
+    ], catchAll: { enabled: false, amount: 40 } } };
+assert.strictEqual(planBuys([{ name: 'X', amount: 500, rate: -0.10 }], SCrMid, [])[0].amount, 30);
+// 全部启用档都关 → 不买(catchAll 也关)
+var SCrAllOff = { base: { enabled: false }, dca: { enabled: false },
+    costReduce: { enabled: true, tiers: [
+        { maxLoss: 0.05, amount: 10, enabled: false }, { maxLoss: 0.10, amount: 20, enabled: false },
+    ], catchAll: { enabled: false, amount: 30 } } };
+assert.strictEqual(planBuys([{ name: 'X', amount: 500, rate: -0.04 }], SCrAllOff, []).length, 0);
+// catchAll 不受档位开关影响:启用档都不命中(超最深)+ catchAll 开 → 走兜底 50
+var SCrCa = { base: { enabled: false }, dca: { enabled: false },
+    costReduce: { enabled: true, tiers: [
+        { maxLoss: 0.05, amount: 10, enabled: false }, { maxLoss: 0.10, amount: 20, enabled: false },
+    ], catchAll: { enabled: true, amount: 50 } } };
+assert.strictEqual(planBuys([{ name: 'X', amount: 500, rate: -0.20 }], SCrCa, [])[0].amount, 50);
+// 旧 tier 无 enabled 字段 → 视为启用(回归保护):-4% 命中最浅 5% 档(10 元)
+var SCrLegacy = { base: { enabled: false }, dca: { enabled: false },
+    costReduce: { enabled: true, tiers: [{ maxLoss: 0.05, amount: 10 }, { maxLoss: 0.10, amount: 20 }], catchAll: { enabled: false, amount: 30 } } };
+assert.strictEqual(planBuys([{ name: 'X', amount: 500, rate: -0.04 }], SCrLegacy, [])[0].amount, 10);
+
 console.log('✅ strategy-logic tests passed');

@@ -68,7 +68,7 @@ function planBuys(funds, S, groups, onlyKeys) {
         if (allow('costReduce') && S.costReduce && S.costReduce.enabled && f.rate != null && f.rate < 0) {
             var tier = null;
             var crTiers = (S.costReduce.tiers || []).slice().sort(function (a, b) { return a.maxLoss - b.maxLoss; });
-            crTiers.forEach(function (t) { if (!tier && f.rate >= -t.maxLoss) tier = t; });
+            crTiers.forEach(function (t) { if (!tier && t.enabled !== false && f.rate >= -t.maxLoss) tier = t; });
             // 兜底档:普通档都不命中(亏损超过最深档;空 tiers 时任意亏损)→ 启用则用兜底金额
             var catchAll = S.costReduce.catchAll;
             if (!tier && catchAll && catchAll.enabled && catchAll.amount >= 1) {
