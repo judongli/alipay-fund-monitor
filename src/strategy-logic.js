@@ -118,7 +118,7 @@ function planSells(funds, S, onlyKeys) {
         // tiers 自动按 minRate 升序(收益低→高),遍历取最后命中即最高匹配档
         var tpTiers = (S.takeProfit.tiers || []).slice().sort(function (a, b) { return a.minRate - b.minRate; });
         tpTiers.forEach(function (t) {
-            if (f.rate >= t.minRate) tier = t;  // 取 minRate 最高且 <= rate 的档
+            if (f.rate >= t.minRate && t.enabled !== false) tier = t;  // 跳过禁用档,取最高启用命中档
         });
         if (tier) orders.push({ name: f.name, ratio: 1 / tier.ratio, strategy: 'takeProfit' });
     });

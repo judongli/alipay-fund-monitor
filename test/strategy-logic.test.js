@@ -284,4 +284,26 @@ assert.strictEqual(planBuys([{ name: 'X', amount: 500, rate: -0.02 }], Sunsorted
 // 不应改写原配置 tiers(副作用校验)
 assert.deepStrictEqual(SunsortedCR.costReduce.tiers.map(function (t) { return t.maxLoss; }), [0.10, 0.03, 0.05]);
 
+// ---- 档位启用开关:关掉的档视为不存在,回退到相邻启用档 ----
+// 止盈:档 [10%,15%,20%],关 15% → 收益 17% 回退到 10% 档(1/8)
+var STpSw = { takeProfit: { enabled: true, tiers: [
+    { minRate: 0.10, ratio: 8 }, { minRate: 0.15, ratio: 7, enabled: false }, { minRate: 0.20, ratio: 6 },
+] } };
+assert.strictEqual(planSells([{ name: 'X', rate: 0.17 }], STpSw)[0].ratio, 1 / 8);  // 回退 10%档
+// 关掉的高档不影响更高收益:25% 仍命中启用的 20% 档(1/6)
+assert.strictEqual(planSells([{ name: 'X', rate: 0.25 }], STpSw)[0].ratio, 1 / 6);
+// 关最低档 10% → 收益 12% 无更浅启用档 → 不卖
+var STpLo = { takeProfit: { enabled: true, tiers: [
+    { minRate: 0.10, ratio: 8, enabled: false }, { minRate: 0.20, ratio: 6 },
+] } };
+assert.strictEqual(planSells([{ name: 'X', rate: 0.12 }], STpLo).length, 0);
+// 全部命中档都关 → 不卖
+var STpAll = { takeProfit: { enabled: true, tiers: [
+    { minRate: 0.10, ratio: 8, enabled: false }, { minRate: 0.20, ratio: 6, enabled: false },
+] } };
+assert.strictEqual(planSells([{ name: 'X', rate: 0.25 }], STpAll).length, 0);
+// 旧 tier 无 enabled 字段 → 视为启用(回归保护):都启用,25% 命中最高档 20%(1/6)
+var STpLegacy = { takeProfit: { enabled: true, tiers: [{ minRate: 0.10, ratio: 8 }, { minRate: 0.20, ratio: 6 }] } };
+assert.strictEqual(planSells([{ name: 'X', rate: 0.25 }], STpLegacy)[0].ratio, 1 / 6);
+
 console.log('✅ strategy-logic tests passed');
