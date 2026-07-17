@@ -63,12 +63,17 @@ function planBuys(funds, S, groups, onlyKeys) {
     var orders = [];
     (funds || []).forEach(function (f) {
         var hits = [];
-        // ② 可叠加:降本——rate<0,取最浅匹配档(tiers 按 maxLoss 升序,首个 rate>=-maxLoss 命中)
+        // ② 可叠加:降本——rate<0,取最浅匹配档
+        //   tiers 自动按 maxLoss 升序(亏损小→大),首个 rate>=-maxLoss 即最浅匹配档
         if (allow('costReduce') && S.costReduce && S.costReduce.enabled && f.rate != null && f.rate < 0) {
             var tier = null;
-            (S.costReduce.tiers || []).forEach(function (t) {
-                if (!tier && f.rate >= -t.maxLoss) tier = t;
-            });
+            var crTiers = (S.costReduce.tiers || []).slice().sort(function (a, b) { return a.maxLoss - b.maxLoss; });
+            crTiers.forEach(function (t) { if (!tier && f.rate >= -t.maxLoss) tier = t; });
+            // 兜底档:普通档都不命中(亏损超过最深档;空 tiers 时任意亏损)→ 启用则用兜底金额
+            var catchAll = S.costReduce.catchAll;
+            if (!tier && catchAll && catchAll.enabled && catchAll.amount >= 1) {
+                tier = { amount: catchAll.amount };
+            }
             if (tier) hits.push({ amount: tier.amount, strategy: 'costReduce' });
         }
         // ① 二选一:底仓 vs 定投,取金额高者(并列 base>dca)
@@ -110,7 +115,9 @@ function planSells(funds, S, onlyKeys) {
     (funds || []).forEach(function (f) {
         if (f.rate == null || f.rate <= 0) return;
         var tier = null;
-        (S.takeProfit.tiers || []).forEach(function (t) {
+        // tiers 自动按 minRate 升序(收益低→高),遍历取最后命中即最高匹配档
+        var tpTiers = (S.takeProfit.tiers || []).slice().sort(function (a, b) { return a.minRate - b.minRate; });
+        tpTiers.forEach(function (t) {
             if (f.rate >= t.minRate) tier = t;  // 取 minRate 最高且 <= rate 的档
         });
         if (tier) orders.push({ name: f.name, ratio: 1 / tier.ratio, strategy: 'takeProfit' });

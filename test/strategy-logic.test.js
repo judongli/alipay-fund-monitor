@@ -36,7 +36,7 @@ assert.deepStrictEqual(dcaCandidates('A', Sbad, [{ id: 'g', name: 'g', funds: ['
 var S = {
     base: { enabled: true, target: 100, amount: 100 },
     dca: { enabled: true, allEnabled: false, allAmount: 200 },
-    costReduce: { enabled: true, tiers: [{ maxLoss: 0.05, amount: 10 }, { maxLoss: 0.10, amount: 20 }] },
+    costReduce: { enabled: true, tiers: [{ maxLoss: 0.05, amount: 10 }, { maxLoss: 0.10, amount: 20 }], catchAll: { enabled: false, amount: 20 } },
     takeProfit: {
         enabled: true,
         tiers: [
@@ -176,6 +176,39 @@ assert.strictEqual(planBuys([{ name: 'X', amount: 500, rate: -0.05 }], S, groups
 assert.strictEqual(planBuys([{ name: 'X', amount: 500, rate: -0.10 }], S, groups)[0].amount, 20);  // 命中 10%档
 assert.strictEqual(planBuys([{ name: 'X', amount: 500, rate: -0.11 }], S, groups).length, 0);      // 超最深档,定投也未命中(无 ALL)
 
+// ---- 降本兜底档:亏损超过最深档时触发 ----
+var Sca = {
+    base: { enabled: false }, dca: { enabled: false },
+    costReduce: { enabled: true, tiers: [{ maxLoss: 0.05, amount: 10 }, { maxLoss: 0.10, amount: 20 }], catchAll: { enabled: true, amount: 30 } },
+};
+// 兜底关(回归):超最深档 → 无命中(S.catchAll.enabled=false)
+assert.strictEqual(planBuys([{ name: 'X', amount: 500, rate: -0.11 }], S, groups).length, 0);
+// 兜底开:rate=-0.11(超 10%档)→ 命中兜底 30
+assert.strictEqual(planBuys([{ name: 'X', amount: 500, rate: -0.11 }], Sca, groups)[0].amount, 30);
+assert.strictEqual(planBuys([{ name: 'X', amount: 500, rate: -0.11 }], Sca, groups)[0].strategy, 'costReduce');
+// 严格更深:rate=-0.10 仍走最深档 20,不走兜底
+assert.strictEqual(planBuys([{ name: 'X', amount: 500, rate: -0.10 }], Sca, groups)[0].amount, 20);
+// rate=-0.50 深跌 → 兜底 30
+assert.strictEqual(planBuys([{ name: 'X', amount: 500, rate: -0.50 }], Sca, groups)[0].amount, 30);
+// 兜底开 + 空 tiers:任意亏损走兜底
+var ScaEmpty = { base: { enabled: false }, dca: { enabled: false }, costReduce: { enabled: true, tiers: [], catchAll: { enabled: true, amount: 30 } } };
+assert.strictEqual(planBuys([{ name: 'X', amount: 500, rate: -0.03 }], ScaEmpty, groups)[0].amount, 30);
+// 兜底金额<1 视为无效 → 无命中
+var ScaBad = { base: { enabled: false }, dca: { enabled: false }, costReduce: { enabled: true, tiers: [{ maxLoss: 0.10, amount: 20 }], catchAll: { enabled: true, amount: 0.5 } } };
+assert.strictEqual(planBuys([{ name: 'X', amount: 500, rate: -0.11 }], ScaBad, groups).length, 0);
+// 兜底与底仓合并:亏损超深档 + 小仓 → costReduce+base 合并金额
+var ScaMix = {
+    base: { enabled: true, target: 1000, amount: 100 },
+    dca: { enabled: false },
+    costReduce: { enabled: true, tiers: [{ maxLoss: 0.10, amount: 20 }], catchAll: { enabled: true, amount: 30 } },
+};
+var caMix = planBuys([{ name: 'X', amount: 50, rate: -0.11 }], ScaMix, groups);
+assert.strictEqual(caMix.length, 1);
+assert.strictEqual(caMix[0].amount, 130);  // 兜底30 + 底仓100
+assert.strictEqual(caMix[0].strategy, 'costReduce+base');
+// onlyKeys 排除 costReduce → 兜底也不生效
+assert.strictEqual(planBuys([{ name: 'X', amount: 500, rate: -0.11 }], Sca, groups, ['base']).length, 0);
+
 // ---- 各策略 disabled 不产出 ----
 assert.strictEqual(planBuys(funds, { base: { enabled: false }, dca: { enabled: false }, costReduce: { enabled: false } }, groups).length, 0);
 // 只开底仓:小仓盈利 + 亏损浅/深(amount=500>=100 不命中底仓)→ 只有"小仓盈利"
@@ -227,5 +260,28 @@ assert.strictEqual(planBuys(funds, S, groups, null).length, buys.length);
 // planSells onlyKeys:排除 takeProfit → 不卖
 assert.strictEqual(planSells(sellFunds, S, ['base']).length, 0);
 assert.strictEqual(planSells(sellFunds, S, ['takeProfit']).length, 4);  // 含 takeProfit → 正常卖
+
+// ---- 档位自动排序:输入乱序也应按收益/亏损低→高匹配 ----
+// 止盈:乱序 tiers,ratio 应取最高匹配档(按 minRate 升序后取最后命中)
+var SunsortedTP = { takeProfit: { enabled: true, tiers: [
+    { minRate: 0.30, ratio: 4 }, { minRate: 0.10, ratio: 8 }, { minRate: 0.45, ratio: 1 }, { minRate: 0.20, ratio: 6 },
+] } };
+// rate=0.25 → 命中 minRate<=0.25 的最高档(0.20 → 1/6),而非列表首个 0.30
+assert.strictEqual(planSells([{ name: 'X', rate: 0.25 }], SunsortedTP)[0].ratio, 1 / 6);
+// rate=0.40 → 命中 0.30 档(1/4),而非 0.45
+assert.strictEqual(planSells([{ name: 'X', rate: 0.40 }], SunsortedTP)[0].ratio, 1 / 4);
+// rate=0.09 → 不到最低档 0.10 → 不卖
+assert.strictEqual(planSells([{ name: 'X', rate: 0.09 }], SunsortedTP).length, 0);
+// 降本:乱序 tiers,亏损应取最浅匹配档(按 maxLoss 升序后取首个命中)
+var SunsortedCR = { base: { enabled: false }, dca: { enabled: false },
+    costReduce: { enabled: true, tiers: [
+        { maxLoss: 0.10, amount: 20 }, { maxLoss: 0.03, amount: 5 }, { maxLoss: 0.05, amount: 10 },
+    ], catchAll: { enabled: false, amount: 30 } } };
+// rate=-0.04 → 最浅匹配是 5%档(10 元),而非列表首个 10%档(20 元)
+assert.strictEqual(planBuys([{ name: 'X', amount: 500, rate: -0.04 }], SunsortedCR, [])[0].amount, 10);
+// rate=-0.02 → 3%档(5 元)
+assert.strictEqual(planBuys([{ name: 'X', amount: 500, rate: -0.02 }], SunsortedCR, [])[0].amount, 5);
+// 不应改写原配置 tiers(副作用校验)
+assert.deepStrictEqual(SunsortedCR.costReduce.tiers.map(function (t) { return t.maxLoss; }), [0.10, 0.03, 0.05]);
 
 console.log('✅ strategy-logic tests passed');
