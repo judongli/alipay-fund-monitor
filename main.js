@@ -55,7 +55,7 @@ function openFloaty(title) {
                     <text id="dot" text="●" textColor="#c0392b" textSize="11sp" margin="0 0 6 0" />
                     <text id="title" text="进度" textColor="#8b857b" textSize="10sp" />
                 </horizontal>
-                <text id="op" text="准备中…" textColor="#1c1a17" textSize="13sp" textStyle="bold" margin="0 4 0 0" />
+                <text id="op" text="准备中…" textColor="#3d342a" textSize="13sp" textStyle="bold" margin="0 4 0 0" />
             </vertical>
         </frame>
     ); } catch (e) { console.log("悬浮窗创建失败: " + e); fw = null; return; }
@@ -158,9 +158,16 @@ function planBuys(funds, S, groups, onlyKeys) {
     (funds || []).forEach(function (f) {
         var hits = [];
         // ② 可叠加:降本——rate<0,取最浅匹配档
+        //   tiers 自动按 maxLoss 升序(亏损小→大),首个 rate>=-maxLoss 即最浅匹配档
         if (allow('costReduce') && S.costReduce && S.costReduce.enabled && f.rate != null && f.rate < 0) {
             var tier = null;
-            (S.costReduce.tiers || []).forEach(function (t) { if (!tier && f.rate >= -t.maxLoss) tier = t; });
+            var crTiers = (S.costReduce.tiers || []).slice().sort(function (a, b) { return a.maxLoss - b.maxLoss; });
+            crTiers.forEach(function (t) { if (!tier && f.rate >= -t.maxLoss) tier = t; });
+            // 兜底档:普通档都不命中(亏损超过最深档;空 tiers 时任意亏损)→ 启用则用兜底金额
+            var catchAll = S.costReduce.catchAll;
+            if (!tier && catchAll && catchAll.enabled && catchAll.amount >= 1) {
+                tier = { amount: catchAll.amount };
+            }
             if (tier) hits.push({ amount: tier.amount, strategy: 'costReduce' });
         }
         // ① 二选一:底仓 vs 定投,取金额高者(并列 base>dca)
@@ -194,7 +201,9 @@ function planSells(funds, S, onlyKeys) {
     (funds || []).forEach(function (f) {
         if (f.rate == null || f.rate <= 0) return;
         var tier = null;
-        (S.takeProfit.tiers || []).forEach(function (t) { if (f.rate >= t.minRate) tier = t; });
+        // tiers 自动按 minRate 升序(收益低→高),遍历取最后命中即最高匹配档
+        var tpTiers = (S.takeProfit.tiers || []).slice().sort(function (a, b) { return a.minRate - b.minRate; });
+        tpTiers.forEach(function (t) { if (f.rate >= t.minRate) tier = t; });
         if (tier) orders.push({ name: f.name, ratio: 1 / tier.ratio, strategy: 'takeProfit' });
     });
     return orders;
@@ -250,7 +259,7 @@ var DEFAULT_CFG = {
     strategies: {
         base:       { enabled: false, target: 100, amount: 100 },                       // 全局:持仓<目标 → 买 单次金额
         dca:        { enabled: false, allEnabled: false, allAmount: 100 },               // 组别级:allEnabled/allAmount 管全部基金;各组自带 dcaEnabled/dcaAmount
-        costReduce: { enabled: false, tiers: [{ maxLoss: 0.05, amount: 10 }, { maxLoss: 0.10, amount: 20 }] },
+        costReduce: { enabled: false, tiers: [{ maxLoss: 0.05, amount: 10 }, { maxLoss: 0.10, amount: 20 }], catchAll: { enabled: false, amount: 20 } },
         takeProfit: { enabled: false, tiers: [
             { minRate: 0.10, ratio: 8 }, { minRate: 0.15, ratio: 7 }, { minRate: 0.20, ratio: 6 },
             { minRate: 0.25, ratio: 5 }, { minRate: 0.30, ratio: 4 }, { minRate: 0.35, ratio: 3 },
@@ -275,7 +284,15 @@ function migrateStrategy(sk, saved) {
             allAmount: has('allAmount') ? saved.allAmount : 100,
         };
     }
-    if (sk === 'costReduce' || sk === 'takeProfit') {
+    if (sk === 'costReduce') {
+        var ca = (has('catchAll') && saved.catchAll) ? saved.catchAll : DEFAULT_CFG.strategies.costReduce.catchAll;
+        return {
+            enabled: has('enabled') ? !!saved.enabled : (has('inPool') ? !!saved.inPool : false),
+            tiers: has('tiers') ? saved.tiers : DEFAULT_CFG.strategies.costReduce.tiers,
+            catchAll: { enabled: !!ca.enabled, amount: (ca.amount != null && !isNaN(+ca.amount)) ? +ca.amount : 20 },
+        };
+    }
+    if (sk === 'takeProfit') {
         return {
             enabled: has('enabled') ? !!saved.enabled : (has('inPool') ? !!saved.inPool : false),
             tiers: has('tiers') ? saved.tiers : DEFAULT_CFG.strategies[sk].tiers,
@@ -385,7 +402,7 @@ function inferInputType(title) {
 function cardSelect(title, items, cb, defaultIdx) {
     var list = ui.inflate(
         <vertical padding="4 4 4 2">
-            <text id="title" textSize="14sp" textStyle="bold" textColor="#1c1a17" padding="12 12 12 8" />
+            <text id="title" textSize="14sp" textStyle="bold" textColor="#3d342a" padding="12 12 12 8" />
             <vertical id="rows" />
         </vertical>);
     list.title.setText(title);
@@ -393,7 +410,7 @@ function cardSelect(title, items, cb, defaultIdx) {
         var isCancel = (it === "取消" || it === "✕ 取消");
         var row = ui.inflate(
             <horizontal gravity="center_vertical" padding="14 13" margin="6 0 6 2">
-                <text id="lab" textSize="13sp" textColor="#1c1a17" layout_weight="1" />
+                <text id="lab" textSize="13sp" textColor="#3d342a" layout_weight="1" />
             </horizontal>);
         row.lab.setText(it);
         row.setBackground(roundRect(isCancel ? "#f6f4ef" : "#fffdf8", 10, isCancel ? null : "#eee8db", isCancel ? 0 : 1));
@@ -412,8 +429,8 @@ function cardInput(title, prefill, hint, cb, inputType) {
     var it = inputType || inferInputType(title);
     var card = ui.inflate(
         <vertical padding="16 16 14 14">
-            <text id="title" textSize="14sp" textStyle="bold" textColor="#1c1a17" padding="0 0 0 10" />
-            <input id="field" textSize="15sp" textColor="#1c1a17" padding="12 12" margin="0 0 14 14" />
+            <text id="title" textSize="14sp" textStyle="bold" textColor="#3d342a" padding="0 0 0 10" />
+            <input id="field" textSize="15sp" textColor="#3d342a" padding="12 12" margin="0 0 14 14" />
             <horizontal>
                 <text id="ok" text="✓ 确定" textSize="14sp" textStyle="bold" textColor="#fffdf8" padding="14 12" layout_weight="1" gravity="center" margin="0 0 6 0" />
                 <text id="cancel" text="✕ 取消" textSize="14sp" textStyle="bold" textColor="#8b857b" padding="14 12" layout_weight="1" gravity="center" margin="6 0 0 0" />
@@ -428,7 +445,7 @@ function cardInput(title, prefill, hint, cb, inputType) {
         var map = { number: IT.TYPE_CLASS_NUMBER, numberPassword: IT.TYPE_CLASS_NUMBER | IT.TYPE_NUMBER_VARIATION_PASSWORD, text: IT.TYPE_CLASS_TEXT, textPassword: IT.TYPE_CLASS_TEXT | IT.TYPE_TEXT_VARIATION_PASSWORD };
         if (map[it]) card.field.setInputType(map[it]);
     } catch (e) {}
-    card.ok.setBackground(roundRect("#1c1a17", 10, null, 0));
+    card.ok.setBackground(roundRect("#3d342a", 10, null, 0));
     card.cancel.setBackground(roundRect("#f0ebe0", 10, null, 0));
     card.ok.on("click", function () {
         var v = card.field.getText().toString();
@@ -450,7 +467,7 @@ function cardInput(title, prefill, hint, cb, inputType) {
 function cardConfirm(title, msg, cb) {
     var card = ui.inflate(
         <vertical padding="18 18 14 14">
-            <text id="title" textSize="15sp" textStyle="bold" textColor="#1c1a17" padding="0 0 0 8" />
+            <text id="title" textSize="15sp" textStyle="bold" textColor="#3d342a" padding="0 0 0 8" />
             <text id="msg" textSize="13sp" textColor="#6a645a" padding="0 0 16 0" />
             <horizontal>
                 <text id="ok" text="✓ 确认" textSize="14sp" textStyle="bold" textColor="#fffdf8" padding="14 12" layout_weight="1" gravity="center" margin="0 0 6 0" />
@@ -459,10 +476,137 @@ function cardConfirm(title, msg, cb) {
         </vertical>);
     card.title.setText(title);
     card.msg.setText(msg || "");
-    card.ok.setBackground(roundRect("#c0392b", 10, null, 0));
+    card.ok.setBackground(roundRect("#a8443a", 10, null, 0));
     card.cancel.setBackground(roundRect("#f0ebe0", 10, null, 0));
     card.ok.on("click", function () { hideCard(); cb(true); });
     card.cancel.on("click", function () { hideCard(); cb(false); });
+    showCard(card);
+}
+
+// 运行报告卡片:运行结束切回 App 后弹出,汇总成交/失败/跳过 + 逐只基金明细。
+// summary: { ts, mode, buy, sell, ok, fail, skip, err?, fundMap, hdr, detail[] }
+//   detail[]: { a:'buy'|'sell', name, s:status, m:msg, amt?, strat?, ratio? }
+function cardReport(summary) {
+    var s = summary || {};
+    var card = ui.inflate(
+        <vertical padding="16 16 14 14">
+            <horizontal gravity="center_vertical">
+                <text id="title" textSize="15sp" textStyle="bold" textColor="#3d342a" layout_weight="1" />
+                <text id="mode" textSize="10sp" textStyle="bold" textColor="#fffdf8" padding="7 3" />
+            </horizontal>
+            <text id="ts" textSize="11sp" textColor="#8b857b" margin="0 3 0 12" />
+            <horizontal id="stats" margin="0 0 0 12" />
+            <vertical id="dist" visibility="gone" margin="0 0 0 12" />
+            <vertical id="rows" margin="0 2 0 0" />
+            <text id="more" visibility="gone" textSize="10sp" textColor="#8b857b" gravity="center" padding="0 6" />
+            <text id="ok" text="✓ 完成" textSize="14sp" textStyle="bold" textColor="#fffdf8" padding="14 12" gravity="center" margin="14 12 4 4" />
+        </vertical>);
+    card.title.setText("运行报告");
+    card.mode.setText(s.mode === '模拟' ? '模拟 · 不下单' : '真实下单');
+    card.mode.setBackground(roundRect(s.mode === '模拟' ? "#8b857b" : "#a8443a", 8, null, 0));
+    card.ts.setText(s.ts ? fmtTs(s.ts) : "");
+    // 汇总四格:成交 · 失败 · 跳过 · 买入合计
+    var det = s.detail || [];
+    var buyTotal = 0;
+    det.forEach(function (d) { if (d.a === 'buy' && d.s === 'ok' && d.amt) buyTotal += d.amt; });
+    var cell = function (num, lab, col) {
+        var v = ui.inflate(
+            <vertical gravity="center" padding="0 6" layout_weight="1" margin="3 0">
+                <text id="n" textSize="18sp" textStyle="bold" />
+                <text id="l" textSize="10sp" textColor="#8b857b" />
+            </vertical>);
+        v.n.setText("" + num); v.n.setTextColor(COL(col));
+        v.l.setText(lab);
+        v.setBackground(roundRect("#f6f4ef", 10, "#eee8db", 1));
+        return v;
+    };
+    card.stats.addView(cell(s.ok || 0, "成交", "#2e8b57"));
+    card.stats.addView(cell(s.fail || 0, "失败", "#c0392b"));
+    card.stats.addView(cell(s.skip || 0, "跳过", "#8b857b"));
+    card.stats.addView(cell(buyTotal ? money(buyTotal).replace("¥", "") : "0", "买入合计", "#5a7a52"));
+    // 策略命中分布行(填充预留的 dist 占位):统计 detail 里各策略出现次数
+    var stratCount = {};
+    det.forEach(function (d) {
+        if (!d.strat) return;
+        d.strat.split('+').forEach(function (k) { stratCount[k] = (stratCount[k] || 0) + 1; });
+    });
+    var stratKeys = ['底仓', '定投', '降本', '止盈'];
+    var stratHit = stratKeys.filter(function (k) { return stratCount[k]; });
+    if (stratHit.length) {
+        var chipRow = ui.inflate(
+            <horizontal gravity="center_vertical" padding="11 9">
+                <text text="命中" textSize="10sp" textStyle="bold" textColor="#8b857b" margin="0 0 8 0" />
+                <horizontal id="chips" layout_weight="1" />
+            </horizontal>);
+        chipRow.setBackground(roundRect("#fffdf8", 10, "#eee8db", 1));
+        stratHit.forEach(function (k) {
+            var chip = ui.inflate(<text textSize="10sp" textStyle="bold" textColor="#3d342a" padding="7 3" margin="0 0 5 0" />);
+            chip.setText(k + " " + stratCount[k]);
+            chip.setBackground(roundRect("#efe9dc", 6, null, 0));
+            chipRow.chips.addView(chip);
+        });
+        card.dist.addView(chipRow);
+        card.dist.setVisibility(0);
+    }
+    // 异常行(策略引擎中途抛错时)
+    var rows = card.rows;
+    if (s.err) {
+        var er = ui.inflate(
+            <horizontal gravity="center_vertical" padding="11 10" margin="0 0 0 6">
+                <text text="❌" textSize="14sp" margin="0 0 8 0" />
+                <text id="m" textSize="12sp" textColor="#c0392b" layout_weight="1" />
+            </horizontal>);
+        er.m.setText("策略异常: " + s.err);
+        er.setBackground(roundRect("#fbeceb", 10, "#e9c8c4", 1));
+        rows.addView(er);
+    }
+    if (!det.length && !s.err) {
+        rows.addView(ui.inflate(<text text="无操作(未命中任何策略)" textColor="#8b857b" textSize="12sp" padding="0 12" />));
+    }
+    var ST = { ok: { icon: '✅', lab: '成交', col: '#2e8b57' }, skipped: { icon: '⏭', lab: '跳过', col: '#8b857b' },
+        dry_run_stopped_at_pwd: { icon: '⏸', lab: '模拟停', col: '#b0704a' }, rejected: { icon: '✕', lab: '拒绝', col: '#8b857b' },
+        error: { icon: '❌', lab: '失败', col: '#c0392b' } };
+    // 明细超 10 条截断(无 scroll,避免卡片过高溢出屏幕)
+    var MAX_ROWS = 10;
+    var shown = det.slice(0, MAX_ROWS);
+    shown.forEach(function (d) {
+        var isBuy = d.a === 'buy';
+        var st = ST[d.s] || { icon: '❌', lab: d.s || '未知', col: '#c0392b' };
+        var f = (s.fundMap && s.fundMap[d.name]) || {};
+        var row = ui.inflate(
+            <horizontal gravity="center_vertical" padding="10 9" margin="0 0 0 5">
+                <text id="tag" textSize="10sp" textStyle="bold" textColor="#fffdf8" padding="5 3" />
+                <vertical layout_weight="1" margin="8 0 0 0">
+                    <horizontal gravity="center_vertical">
+                        <text id="nm" textSize="13sp" textColor="#3d342a" layout_weight="1" />
+                        <text id="rt" textSize="11sp" textStyle="bold" />
+                    </horizontal>
+                    <text id="meta" textSize="10sp" textColor="#8b857b" margin="0 2 0 0" />
+                </vertical>
+                <text id="st" textSize="11sp" textStyle="bold" margin="0 0 0 8" />
+            </horizontal>);
+        row.tag.setText(isBuy ? '买' : '卖');
+        row.tag.setBackground(roundRect(isBuy ? '#5a7a52' : '#b0704a', 5, null, 0));
+        row.nm.setText(d.name);
+        // 收益率(带涨跌色)+ 持仓金额,关联采集快照
+        if (f.rate != null) { row.rt.setText(pct(f.rate)); row.rt.setTextColor(COL(hexOf(f.rate))); }
+        else { row.rt.setVisibility(8); }
+        var meta = isBuy ? (d.amt != null ? money(d.amt) : '') : ('卖 1/' + (d.ratio ? Math.round(1 / d.ratio) : '?'));
+        if (f.amount != null) meta += ' · 持仓 ' + money(f.amount);
+        if (d.strat) meta += ' · ' + d.strat;
+        if (d.s !== 'ok' && d.m) meta += ' · ' + d.m;
+        row.meta.setText(meta);
+        row.st.setText(st.icon + ' ' + st.lab);
+        row.st.setTextColor(COL(st.col));
+        row.setBackground(roundRect("#fffdf8", 9, "#eee8db", 1));
+        rows.addView(row);
+    });
+    if (det.length > MAX_ROWS) {
+        card.more.setText("…还有 " + (det.length - MAX_ROWS) + " 只未显示");
+        card.more.setVisibility(0);
+    }
+    card.ok.setBackground(roundRect("#3d342a", 10, null, 0));
+    card.ok.on("click", function () { hideCard(); });
     showCard(card);
 }
 
@@ -476,7 +620,7 @@ function rawInputAsync(title, prefill, cb) {
 function cardMultiSelect(title, items, cb) {
     var card = ui.inflate(
         <vertical padding="4 4 4 2">
-            <text id="title" textSize="14sp" textStyle="bold" textColor="#1c1a17" padding="12 12 12 8" />
+            <text id="title" textSize="14sp" textStyle="bold" textColor="#3d342a" padding="12 12 12 8" />
             <vertical id="rows" padding="6 0 6 2" />
             <horizontal padding="10 6 6 6">
                 <text id="ok" text="✓ 确定" textSize="14sp" textStyle="bold" textColor="#fffdf8" padding="14 12" layout_weight="1" gravity="center" margin="0 0 6 0" />
@@ -492,7 +636,7 @@ function cardMultiSelect(title, items, cb) {
                 <vertical id="box" w="22" h="22" gravity="center" margin="0 0 12 0" />
                 <vertical layout_weight="1">
                     <horizontal gravity="center_vertical">
-                        <text id="lab" textSize="14sp" textStyle="bold" textColor="#1c1a17" />
+                        <text id="lab" textSize="14sp" textStyle="bold" textColor="#3d342a" />
                         <text id="side" textSize="10sp" textStyle="bold" textColor="#8b857b" padding="5 2" margin="8 0 0 0" />
                     </horizontal>
                     <text id="sub" textSize="11sp" textColor="#8b857b" margin="0 2 0 0" />
@@ -506,13 +650,13 @@ function cardMultiSelect(title, items, cb) {
         var render = function () {
             // 勾选框:勾上=深墨底白勾;未勾=浅描边空框。每次新建 tick(避免单实例被多框争用)
             row.box.removeAllViews();
-            row.box.setBackground(roundRect(state[i] ? "#1c1a17" : "#fffdf8", 6, state[i] ? null : "#c4bcaa", state[i] ? 0 : 1.5));
+            row.box.setBackground(roundRect(state[i] ? "#3d342a" : "#fffdf8", 6, state[i] ? null : "#c4bcaa", state[i] ? 0 : 1.5));
             if (state[i]) {
                 var tk = ui.inflate(<text text="✓" textSize="15sp" textStyle="bold" textColor="#fffdf8" gravity="center" />);
                 row.box.addView(tk);
             }
             var dim = it.disabled;
-            row.lab.setTextColor(COL(dim ? "#b8b1a6" : "#1c1a17"));
+            row.lab.setTextColor(COL(dim ? "#b8b1a6" : "#3d342a"));
             row.side.setTextColor(COL(dim ? "#cfc8b8" : (it.side === '卖' ? "#b0704a" : "#5a7a52")));
             row.sub.setTextColor(COL(dim ? "#d8d2c5" : "#8b857b"));
             row.prm.setTextColor(COL(dim ? "#cfc8b8" : "#6a645a"));
@@ -530,7 +674,7 @@ function cardMultiSelect(title, items, cb) {
     var updateOk = function () {
         var any = state.some(function (s) { return s; });
         card.ok.setTextColor(COL(any ? "#fffdf8" : "#9a948a"));
-        card.ok.setBackground(roundRect(any ? "#1c1a17" : "#cfc8b8", 10, null, 0));
+        card.ok.setBackground(roundRect(any ? "#3d342a" : "#cfc8b8", 10, null, 0));
         card.ok.setEnabled(any);
         card.ok.setAlpha(any ? 1 : 0.6);
     };
@@ -564,9 +708,9 @@ function renderConfig() {
     // 顶部返回条
     var top = ui.inflate(
         <horizontal gravity="center_vertical" margin="0 2 0 10">
-            <button id="back" text="← 返回" textColor="#1c1a17" textSize="13sp" padding="14 9" />
+            <button id="back" text="← 返回" textColor="#3d342a" textSize="13sp" padding="14 9" />
             <vertical layout_weight="1" padding="6 0 0 0">
-                <text text="交易配置" textColor="#1c1a17" textSize="16sp" textStyle="bold" />
+                <text text="交易配置" textColor="#3d342a" textSize="16sp" textStyle="bold" />
                 <text text="长按基金卡片可触发交易(演示)" textColor="#8b857b" textSize="11sp" />
             </vertical>
         </horizontal>);
@@ -585,7 +729,7 @@ function renderConfig() {
 
     // 1. 支付密码
     var pinCard = buildConfigRow("支付密码", "6 位数字 · AES-GCM 加密落盘",
-        pinSet ? "已设置 · 点此重置" : "未设置 · 点此设置", pinSet ? "#2e8b57" : "#c0392b",
+        pinSet ? "已设置 · 点此重置" : "未设置 · 点此设置", pinSet ? "#8a6a2f" : "#a8443a",
         function () {
             rawInputAsync("输入 6 位支付密码", "", function (pin) {
                 if (pin && /^\d{6}$/.test(pin)) {
@@ -599,7 +743,7 @@ function renderConfig() {
 
     // 2. 单笔上限
     var maxCard = buildConfigRow("单笔金额上限", "超过此金额的交易将被拒绝",
-        c.maxAmount + " 元", "#1c1a17",
+        c.maxAmount + " 元", "#3d342a",
         function () {
             rawInputAsync("单笔金额上限(元)", "" + c.maxAmount, function (m) {
                 if (m && !isNaN(+m)) saveTradeConfig({ maxAmount: +m });
@@ -610,7 +754,7 @@ function renderConfig() {
 
     // 3. 二次确认阈值
     var thrCard = buildConfigRow("二次确认阈值", "超过此金额需弹窗确认",
-        c.confirmThreshold + " 元", "#1c1a17",
+        c.confirmThreshold + " 元", "#3d342a",
         function () {
             rawInputAsync("大额二次确认阈值(元)", "" + c.confirmThreshold, function (t) {
                 if (t && !isNaN(+t)) saveTradeConfig({ confirmThreshold: +t });
@@ -656,14 +800,17 @@ function renderConfig() {
     relTag2.setText("买入 · 可叠加(与上方同时命中,金额合并)");
     stratRows.addView(relTag2);
 
+    var crCatchAll = (S.costReduce.catchAll && S.costReduce.catchAll.enabled)
+        ? " / 兜底→" + S.costReduce.catchAll.amount + "元" : "";
     stratRows.addView(buildStrategyCard("降本", "亏损时买入,按亏损档位加码(全局)",
-        S.costReduce.tiers.map(function (t) { return (t.maxLoss * 100) + "%内→" + t.amount + "元"; }).join(" / ") || "无档位", S.costReduce.enabled, function (en) {
+        (S.costReduce.tiers.map(function (t) { return (t.maxLoss * 100) + "%内→" + t.amount + "元"; }).join(" / ") || "无档位") + crCatchAll, S.costReduce.enabled, function (en) {
             saveStrategy('costReduce', { enabled: en });
         }, function () {
             safeRender("降本档位", function () {
                 renderTiersEdit("降本档位", S.costReduce.tiers,
                     [{ k: 'maxLoss', label: '亏损%', scale: 100 }, { k: 'amount', label: '金额(元)' }],
-                    function (tiers) { saveStrategy('costReduce', { tiers: tiers }); });
+                    function (tiers) { saveStrategy('costReduce', { tiers: tiers }); },
+                    renderCatchAllFooter);
             });
         }));
 
@@ -689,7 +836,7 @@ function renderConfig() {
 
     // 模拟运行开关(原 dry-run):开=走到密码页前停止不真实下单,关=真实下单
     var dryCard = buildConfigRow("模拟运行（不下单）", "开:走到密码页前停止,不真实下单",
-        c.dryRun ? "开 · 模拟" : "关 · 真实", c.dryRun ? "#2e8b57" : "#c0392b",
+        c.dryRun ? "开 · 模拟" : "关 · 真实", c.dryRun ? "#8a6a2f" : "#a8443a",
         function () {
             var next = !c.dryRun;
             saveTradeConfig({ dryRun: next });
@@ -699,7 +846,7 @@ function renderConfig() {
     body.addView(dryCard);
 
     var execCard = buildConfigRow("立即执行策略", "扫描全部基金,启用的策略买卖一遍",
-        "▶ " + (c.dryRun ? "模拟" : "真实"), c.dryRun ? "#2e8b57" : "#c0392b",
+        "▶ " + (c.dryRun ? "模拟" : "真实"), c.dryRun ? "#8a6a2f" : "#a8443a",
         function () {
             if (!secretStore.has() && !c.dryRun) { toast("未设置支付密码,无法真实下单"); return; }
             runStrategy();
@@ -742,19 +889,19 @@ function buildStrategyCard(label, sub, paramText, enabled, onToggle, onEdit) {
         <vertical bg="#fffdf8" padding="14 13" margin="0 0 0 8">
             <horizontal gravity="center_vertical">
                 <vertical id="info" layout_weight="1">
-                    <text id="lab" textSize="14sp" textStyle="bold" textColor="#1c1a17" />
+                    <text id="lab" textSize="14sp" textStyle="bold" textColor="#3d342a" />
                     <text id="sub" textSize="11sp" textColor="#8b857b" margin="0 2 0 0" />
                     <text id="prm" textSize="11sp" textColor="#6a645a" margin="0 3 0 0" />
                 </vertical>
                 <text id="pool" textSize="12sp" textStyle="bold" padding="11 7" />
             </horizontal>
         </vertical>);
-    row.setBackground(roundRect(enabled ? "#efe9dc" : "#fffdf8", 12, enabled ? "#1c1a17" : "#e7e1d4", enabled ? 2 : 1));
+    row.setBackground(roundRect(enabled ? "#efe9dc" : "#fffdf8", 12, enabled ? "#3d342a" : "#e7e1d4", enabled ? 2 : 1));
     row.lab.setText(label + (enabled ? " ✓" : ""));
     row.sub.setText(sub);
     row.prm.setText(paramText);
     row.pool.setText(enabled ? "启用" : "停用");
-    row.pool.setBackground(roundRect(enabled ? "#1c1a17" : "#f0ebe0", 10, null, 0));
+    row.pool.setBackground(roundRect(enabled ? "#3d342a" : "#f0ebe0", 10, null, 0));
     row.pool.setTextColor(COL(enabled ? "#fffdf8" : "#8b857b"));
     row.info.on("click", function () { row.info.setAlpha(0.6); onEdit(); });
     row.pool.on("click", function () { onToggle(!enabled); toast(label + (enabled ? " 停用" : " 启用")); ui.post(function () { renderConfig(); }); });
@@ -763,7 +910,7 @@ function buildStrategyCard(label, sub, paramText, enabled, onToggle, onEdit) {
 
 // 分组小标题(纸感 · 次要灰)
 function buildConfigSection(label) {
-    var s = ui.inflate(<text id="lab" textSize="11sp" textStyle="bold" textColor="#b8b1a6" padding="4 14 0 6" margin="0 18 0 0" />);
+    var s = ui.inflate(<text id="lab" textSize="11sp" textStyle="bold" textColor="#a89e8a" padding="2 16 0 5" margin="0 22 0 0" />);
     s.lab.setText(label);
     return s;
 }
@@ -866,7 +1013,7 @@ function buildGroupManager(c) {
     var allRow = ui.inflate(
         <vertical bg="#fffdf8" padding="14 12" margin="0 0 0 6">
             <horizontal gravity="center_vertical">
-                <text text="全部基金" textSize="14sp" textStyle="bold" textColor="#1c1a17" layout_weight="1" />
+                <text text="全部基金" textSize="14sp" textStyle="bold" textColor="#3d342a" layout_weight="1" />
                 <text text="默认 · 不可编辑" textSize="11sp" textColor="#b8b1a6" />
             </horizontal>
         </vertical>);
@@ -900,7 +1047,7 @@ function buildConfigRow(label, sub, value, valueColor, onTap) {
         <vertical bg="#fffdf8" padding="14 13" margin="0 0 0 8">
             <horizontal gravity="center_vertical">
                 <vertical layout_weight="1">
-                    <text id="lab" textSize="14sp" textStyle="bold" textColor="#1c1a17" />
+                    <text id="lab" textSize="14sp" textStyle="bold" textColor="#3d342a" />
                     <text id="sub" textSize="11sp" textColor="#8b857b" margin="0 2 0 0" />
                 </vertical>
                 <text id="val" textSize="13sp" textStyle="bold" gravity="right" />
@@ -923,14 +1070,14 @@ function buildConfigRow(label, sub, value, valueColor, onTap) {
 // 整页头:深墨底白字(现代 toolbar 风,与浅色内容强分隔)。onBack 通常 = renderConfig。
 function editHeader(title, sub, onBack) {
     var top = ui.inflate(
-        <horizontal bg="#1c1a17" gravity="center_vertical" padding="14 16" margin="0 0 0 14">
+        <horizontal bg="#3d342a" gravity="center_vertical" padding="14 16" margin="0 0 0 14">
             <text id="back" text="‹" textColor="#fffdf8" textSize="26sp" padding="6 0 10 0" />
             <vertical layout_weight="1" padding="2 0 0 0">
                 <text id="title" textColor="#fffdf8" textSize="17sp" textStyle="bold" />
                 <text id="sub" textColor="#b8b1a6" textSize="11sp" margin="0 2 0 0" />
             </vertical>
         </horizontal>);
-    top.setBackground(roundRect("#1c1a17", 14, null, 0));
+    top.setBackground(roundRect("#3d342a", 14, null, 0));
     top.title.setText(title);
     if (sub) top.sub.setText(sub); else top.sub.setVisibility(8);
     top.back.on("click", function () { top.back.setAlpha(0.5); ui.post(onBack); });
@@ -956,12 +1103,12 @@ function startEditPage(title, sub) {
     return body;
 }
 
-// 行内开关 chip:开=深墨底白字,关=浅灰底灰字。加大 padding 易点,右侧留间距。
+// 行内开关:胶囊形,固定宽度,开合不跳。开=暖墨底白字,关=浅米底灰字。
 function buildToggleChip(enabled, onToggle) {
-    var row = ui.inflate(<text id="c" textSize="13sp" textStyle="bold" padding="16 9" gravity="center" margin="0 0 6 0" />);
+    var row = ui.inflate(<text id="c" textSize="13sp" textStyle="bold" padding="22 10" gravity="center" minWidth="74" />);
     function apply(en) {
         row.c.setText(en ? "● 开" : "○ 关");
-        row.c.setBackground(roundRect(en ? "#1c1a17" : "#f0ebe0", 12, null, 0));
+        row.c.setBackground(roundRect(en ? "#3d342a" : "#ece4d3", 24, null, 0));
         row.c.setTextColor(COL(en ? "#fffdf8" : "#8b857b"));
     }
     apply(enabled);
@@ -971,16 +1118,16 @@ function buildToggleChip(enabled, onToggle) {
 
 // 行内金额 chip:强调底深墨字"100元",右侧留间距。
 function buildAmountChip(text, onTap) {
-    var c = ui.inflate(<text textSize="13sp" textStyle="bold" textColor="#1c1a17" padding="16 9" gravity="center" margin="0 0 6 0" />);
+    var c = ui.inflate(<text textSize="13sp" textStyle="bold" textColor="#3d342a" padding="16 9" gravity="center" margin="0 0 6 0" />);
     c.setText(text);
     c.setBackground(roundRect("#efe9dc", 12, null, 0));
     c.on("click", function () { c.setAlpha(0.6); onTap(); });
     return c;
 }
 
-// 行内操作小按钮(✎/🗑/+)。label 文本,色 由 bg 决定。
+// 行内操作小按钮(编辑/删除/+)。label 文本,色 由 bg 决定。
 function buildActionChip(label, bg, onTap) {
-    var c = ui.inflate(<text textSize="14sp" padding="13 9" gravity="center" textColor="#1c1a17" />);
+    var c = ui.inflate(<text textSize="14sp" padding="13 9" gravity="center" textColor="#3d342a" />);
     c.setText(label);
     c.setBackground(roundRect(bg || "#f6f4ef", 12, "#e7e1d4", 1));
     c.on("click", function () { c.setAlpha(0.6); onTap(); });
@@ -991,7 +1138,16 @@ function buildActionChip(label, bg, onTap) {
 function buildPrimaryButton(label, bg, onTap) {
     var b = ui.inflate(<text textSize="15sp" textStyle="bold" textColor="#fffdf8" padding="16 15" gravity="center" margin="0 6 0 10" />);
     b.setText(label);
-    b.setBackground(roundRect(bg || "#1c1a17", 14, null, 0));
+    b.setBackground(roundRect(bg || "#3d342a", 14, null, 0));
+    b.on("click", function () { b.setAlpha(0.7); onTap(); });
+    return b;
+}
+
+// 次操作按钮(添加/新建):浅底深墨字,与主按钮(深墨底白字)形成层级。
+function buildSecondaryButton(label, onTap) {
+    var b = ui.inflate(<text textSize="14sp" textStyle="bold" textColor="#3d342a" padding="15 13" gravity="center" margin="0 4 0 6" />);
+    b.setText(label);
+    b.setBackground(roundRect("#efe9dc", 14, "#e0d8c6", 1));
     b.on("click", function () { b.setAlpha(0.7); onTap(); });
     return b;
 }
@@ -1002,7 +1158,7 @@ function cardForm(title, fields, prefillObj, onSave) {
     var inputs = {};
     var card = ui.inflate(
         <vertical padding="18 18 14 14">
-            <text id="title" textSize="14sp" textStyle="bold" textColor="#1c1a17" padding="0 0 0 12" />
+            <text id="title" textSize="14sp" textStyle="bold" textColor="#3d342a" padding="0 0 0 12" />
             <vertical id="rows" />
             <horizontal margin="0 14 0 0">
                 <text id="ok" text="✓ 保存" textSize="14sp" textStyle="bold" textColor="#fffdf8" padding="14 12" layout_weight="1" gravity="center" margin="0 0 6 0" />
@@ -1014,7 +1170,7 @@ function cardForm(title, fields, prefillObj, onSave) {
         var row = ui.inflate(
             <vertical margin="0 0 0 12">
                 <text id="lab" textSize="11sp" textColor="#8b857b" padding="0 0 0 5" />
-                <input id="field" textSize="15sp" textColor="#1c1a17" padding="12 11" />
+                <input id="field" textSize="15sp" textColor="#3d342a" padding="12 11" />
             </vertical>);
         row.lab.setText(f.label);
         row.field.setBackground(roundRect("#f6f4ef", 10, "#e7e1d4", 1));
@@ -1028,7 +1184,7 @@ function cardForm(title, fields, prefillObj, onSave) {
         inputs[f.key] = row.field;
         card.rows.addView(row);
     });
-    card.ok.setBackground(roundRect("#1c1a17", 10, null, 0));
+    card.ok.setBackground(roundRect("#3d342a", 10, null, 0));
     card.cancel.setBackground(roundRect("#f0ebe0", 10, null, 0));
     card.ok.on("click", function () {
         var obj = {};
@@ -1047,11 +1203,12 @@ function renderBaseEdit() {
     var S = loadTradeConfig().strategies;
     var body = startEditPage("底仓", "持仓金额 < 目标时买一笔(全局)");
     body.addView(buildConfigSection("参数"));
-    var fields = ui.inflate(<vertical margin="0 0 0 12" />);
+    var fields = ui.inflate(<vertical bg="#fffdf8" padding="18 18 18 12" margin="0 0 0 16" />);
+    fields.setBackground(roundRect("#fffdf8", 14, "#e7e1d4", 1));
     var tgtInput = ui.inflate(
-        <vertical margin="0 0 0 12">
-            <text text="目标持仓(元)" textSize="11sp" textColor="#8b857b" padding="0 0 0 5" />
-            <input id="f" textSize="15sp" textColor="#1c1a17" padding="12 11" />
+        <vertical margin="0 0 0 14">
+            <text text="目标持仓(元)" textSize="11sp" textColor="#8b857b" padding="0 0 0 6" />
+            <input id="f" textSize="15sp" textColor="#3d342a" padding="12 11" />
         </vertical>);
     tgtInput.f.setText("" + S.base.target);
     tgtInput.f.setBackground(roundRect("#f6f4ef", 10, "#e7e1d4", 1));
@@ -1059,15 +1216,15 @@ function renderBaseEdit() {
     fields.addView(tgtInput);
     var amtInput = ui.inflate(
         <vertical margin="0 0 0 4">
-            <text text="单次金额(元)" textSize="11sp" textColor="#8b857b" padding="0 0 0 5" />
-            <input id="f" textSize="15sp" textColor="#1c1a17" padding="12 11" />
+            <text text="单次金额(元)" textSize="11sp" textColor="#8b857b" padding="0 0 0 6" />
+            <input id="f" textSize="15sp" textColor="#3d342a" padding="12 11" />
         </vertical>);
     amtInput.f.setText("" + S.base.amount);
     amtInput.f.setBackground(roundRect("#f6f4ef", 10, "#e7e1d4", 1));
     try { amtInput.f.setInputType(android.text.InputType.TYPE_CLASS_NUMBER); } catch (e) {}
     fields.addView(amtInput);
     body.addView(fields);
-    body.addView(buildPrimaryButton("✓ 保存", "#1c1a17", function () {
+    body.addView(buildPrimaryButton("✓ 保存", "#3d342a", function () {
         var t = tgtInput.f.getText().toString(), a = amtInput.f.getText().toString();
         if (!t || isNaN(+t) || +t <= 0) { toast("目标持仓需 >0"); return; }
         if (!a || isNaN(+a) || +a < 1) { toast("单次金额需 >=1"); return; }
@@ -1083,19 +1240,27 @@ function renderDcaEdit() {
     var dca = c.strategies.dca, groups = c.groups || [];
     var body = startEditPage("定投管理", "开关开的组,组内每只各按金额买一笔");
     body.addView(buildConfigSection("全部基金"));
-    // 全部基金行:开关 + 金额 chip
+    // 全部基金行:左侧标题+全局标签,右侧仅开关;启用时下方一行金额(可点编辑)
     var allRow = ui.inflate(
         <vertical bg="#fffdf8" padding="14 13" margin="0 0 0 8">
             <horizontal gravity="center_vertical">
                 <vertical layout_weight="1">
-                    <text text="全部基金" textSize="14sp" textStyle="bold" textColor="#1c1a17" />
+                    <horizontal gravity="center_vertical">
+                        <text text="全部基金" textSize="14sp" textStyle="bold" textColor="#3d342a" />
+                        <text text="全局" textSize="10sp" textStyle="bold" textColor="#8a6a2f" padding="6 2" margin="6 0 0 0" />
+                    </horizontal>
                     <text id="sub" textSize="11sp" textColor="#8b857b" margin="0 2 0 0" />
                 </vertical>
                 <horizontal id="ctl" gravity="center_vertical" />
             </horizontal>
+            <horizontal id="amtRow" gravity="center_vertical" margin="12 12 0 0" visibility="gone">
+                <text text="定投金额" textSize="11sp" textColor="#a89e8a" layout_weight="1" />
+                <text id="amt" textSize="13sp" textStyle="bold" textColor="#3d342a" padding="12 7" gravity="center" />
+            </horizontal>
         </vertical>);
-    allRow.setBackground(roundRect(dca.allEnabled ? "#efe9dc" : "#fffdf8", 12, dca.allEnabled ? "#1c1a17" : "#e7e1d4", dca.allEnabled ? 2 : 1));
-    allRow.sub.setText(dca.allEnabled ? "每只买 " + dca.allAmount + " 元" : "未开启");
+    allRow.amtRow.setBackground(roundRect("#f6f4ef", 10, null, 0));
+    allRow.setBackground(roundRect(dca.allEnabled ? "#efe9dc" : "#f6f4ef", 14, dca.allEnabled ? "#3d342a" : "#e0d8c6", dca.allEnabled ? 2 : 1));
+    allRow.sub.setText(dca.allEnabled ? "对每只基金各买一笔" : "未开启");
     var allCtl = allRow.ctl;
     var allToggle = buildToggleChip(dca.allEnabled, function (en) {
         saveStrategy('dca', { allEnabled: en });
@@ -1104,7 +1269,10 @@ function renderDcaEdit() {
     });
     allCtl.addView(allToggle.view);
     if (dca.allEnabled) {
-        allCtl.addView(buildAmountChip(dca.allAmount + "元", function () {
+        allRow.amtRow.setVisibility(0);
+        allRow.amt.setText(dca.allAmount + " 元  ✎");
+        allRow.amt.setBackground(roundRect("#f6f4ef", 10, "#e0d8c6", 1));
+        allRow.amt.on("click", function () { allRow.amt.setAlpha(0.6);
             cardInput("全部基金定投金额(元)", "" + dca.allAmount, null, function (v) {
                 if (v != null && v !== "" && !isNaN(+v) && +v >= 1) {
                     saveStrategy('dca', { allAmount: +v });
@@ -1112,16 +1280,16 @@ function renderDcaEdit() {
                 }
                 ui.post(function () { renderDcaEdit(); });
             });
-        }));
+        });
     }
     body.addView(allRow);
 
     body.addView(buildConfigSection("自定义组别 · " + groups.length + " 组"));
     if (!groups.length) {
         var tip = ui.inflate(
-            <vertical bg="#fffdf8" padding="14 12" margin="0 0 0 8">
-                <text text="暂无组别" textSize="13sp" textColor="#8b857b" />
-                <text text="点下方「+ 新建组别」添加" textSize="11sp" textColor="#b8b1a6" margin="0 3 0 0" />
+            <vertical bg="#fffdf8" padding="16 14" margin="0 0 0 8" gravity="center_horizontal">
+                <text text="暂无组别" textSize="13sp" textColor="#8b857b" gravity="center" />
+                <text text="点下方「+ 新建组别」添加" textSize="11sp" textColor="#b8b1a6" margin="0 4 0 0" gravity="center" />
             </vertical>);
         tip.setBackground(roundRect("#fffdf8", 12, "#e7e1d4", 1));
         body.addView(tip);
@@ -1131,16 +1299,25 @@ function renderDcaEdit() {
                 <vertical bg="#fffdf8" padding="14 13" margin="0 0 0 8">
                     <horizontal gravity="center_vertical">
                         <vertical id="info" layout_weight="1">
-                            <text id="nm" textSize="14sp" textStyle="bold" textColor="#1c1a17" />
+                            <horizontal gravity="center_vertical">
+                                <text id="nm" textSize="14sp" textStyle="bold" textColor="#3d342a" />
+                                <text text="管理 ›" textSize="11sp" textColor="#b8b1a6" margin="8 0 0 0" />
+                            </horizontal>
                             <text id="sub" textSize="11sp" textColor="#8b857b" margin="0 2 0 0" />
                         </vertical>
                         <horizontal id="ctl" gravity="center_vertical" />
                     </horizontal>
+                    <horizontal id="amtRow" gravity="center_vertical" margin="12 12 0 0" visibility="gone">
+                        <text text="定投金额" textSize="11sp" textColor="#a89e8a" layout_weight="1" />
+                        <text id="amt" textSize="13sp" textStyle="bold" textColor="#3d342a" padding="12 7" gravity="center" />
+                    </horizontal>
                 </vertical>);
-            grpRow.setBackground(roundRect(g.dcaEnabled ? "#efe9dc" : "#fffdf8", 12, g.dcaEnabled ? "#1c1a17" : "#e7e1d4", g.dcaEnabled ? 2 : 1));
+            grpRow.setBackground(roundRect(g.dcaEnabled ? "#efe9dc" : "#fffdf8", 14, g.dcaEnabled ? "#3d342a" : "#e7e1d4", g.dcaEnabled ? 2 : 1));
             var preview = (g.funds || []).slice(0, 3).join("、") + ((g.funds || []).length > 3 ? " …" : "");
             grpRow.nm.setText(g.name);
             grpRow.sub.setText((g.funds || []).length + " 只 · " + (preview || "空"));
+            // 左侧标题区整块可点 → 进组别详情(替代小 ✎ 图标)
+            grpRow.info.on("click", function () { grpRow.info.setAlpha(0.6); safeRender("组别", function () { renderGroupDetail(g, groups); }); });
             var ctl = grpRow.ctl;
             var tg = buildToggleChip(g.dcaEnabled, function (en) {
                 g.dcaEnabled = en; saveTradeConfig({ groups: groups });
@@ -1149,7 +1326,10 @@ function renderDcaEdit() {
             });
             ctl.addView(tg.view);
             if (g.dcaEnabled) {
-                ctl.addView(buildAmountChip(g.dcaAmount + "元", function () {
+                grpRow.amtRow.setVisibility(0);
+                grpRow.amt.setText(g.dcaAmount + " 元  ✎");
+                grpRow.amt.setBackground(roundRect("#f6f4ef", 10, "#e0d8c6", 1));
+                grpRow.amt.on("click", function () { grpRow.amt.setAlpha(0.6);
                     cardInput("「" + g.name + "」定投金额(元)", "" + g.dcaAmount, null, function (v) {
                         if (v != null && v !== "" && !isNaN(+v) && +v >= 1) {
                             g.dcaAmount = +v; saveTradeConfig({ groups: groups });
@@ -1157,13 +1337,12 @@ function renderDcaEdit() {
                         }
                         ui.post(function () { renderDcaEdit(); });
                     });
-                }));
+                });
             }
-            ctl.addView(buildActionChip("✎", "#f6f4ef", function () { safeRender("组别", function () { renderGroupDetail(g, groups); }); }));
             body.addView(grpRow);
         });
     }
-    body.addView(buildPrimaryButton("+ 新建组别", "#1c1a17", function () {
+    body.addView(buildPrimaryButton("+ 新建组别", "#3d342a", function () {
         pickFundName(function (fn) {
             if (!fn) return;
             cardInput("新组别名称", "组" + (groups.length + 1), null, function (nm) {
@@ -1180,20 +1359,28 @@ function renderDcaEdit() {
     }));
 }
 
-// 档位整页列表:每档一行,行内 ✎ 编辑 / 🗑 删除,+ 添加,完成保存。
-function renderTiersEdit(title, tiers, fields, onSave) {
+// 档位整页列表:每档一行,行内 编辑 / 删除,+ 添加,完成保存。
+function renderTiersEdit(title, tiers, fields, onSave, footerBuilder) {
     var list = tiers.map(function (t) { return JSON.parse(JSON.stringify(t)); });
     function fmt(t) {
         var a = fields[0], b = fields[1];
         var av = t[a.k] * (a.scale || 1), bv = t[b.k];
         return a.label + " " + (Math.round(av * 100) / 100) + " · " + b.label + " " + bv;
     }
+    // 即时持久化:每次增/改/删后立刻按 fields[0] 升序排序 + onSave 存盘。
+    // 避免用户忘记点「完成返回」导致新档丢失(止盈档位曾因此"添加不进去")。
+    function persist(msg) {
+        var key0 = fields[0].k;
+        list.sort(function (x, y) { return x[key0] - y[key0]; });
+        onSave(list);
+        if (msg) toast(msg);
+    }
     function render() {
         var body = startEditPage(title, "共 " + list.length + " 档 · 行内编辑");
         if (!list.length) {
             var tip = ui.inflate(
-                <vertical bg="#fffdf8" padding="14 12" margin="0 0 0 8">
-                    <text text="暂无档位,点下方「+ 添加」" textSize="13sp" textColor="#8b857b" />
+                <vertical bg="#fffdf8" padding="16 14" margin="0 0 0 8" gravity="center_horizontal">
+                    <text text="暂无档位,点下方「+ 添加」" textSize="13sp" textColor="#8b857b" gravity="center" />
                 </vertical>);
             tip.setBackground(roundRect("#fffdf8", 12, "#e7e1d4", 1));
             body.addView(tip);
@@ -1202,13 +1389,13 @@ function renderTiersEdit(title, tiers, fields, onSave) {
                 var row = ui.inflate(
                     <vertical bg="#fffdf8" padding="14 13" margin="0 0 0 8">
                         <horizontal gravity="center_vertical">
-                            <text id="lab" textSize="13sp" textStyle="bold" textColor="#1c1a17" layout_weight="1" />
+                            <text id="lab" textSize="13sp" textStyle="bold" textColor="#3d342a" layout_weight="1" />
                             <horizontal id="ctl" gravity="center_vertical" />
                         </horizontal>
                     </vertical>);
                 row.setBackground(roundRect("#fffdf8", 12, "#e7e1d4", 1));
                 row.lab.setText(fmt(t));
-                row.ctl.addView(buildActionChip("✎", "#f6f4ef", function () {
+                row.ctl.addView(buildActionChip("编辑", "#f6f4ef", function () {
                     var pre = {}; pre[fields[0].k] = t[fields[0].k] * (fields[0].scale || 1); pre[fields[1].k] = t[fields[1].k];
                     cardForm("编辑档位", fields.map(function (f) {
                         return { key: f.k, label: f.label, inputType: f.scale ? "number" : "number" };
@@ -1216,16 +1403,20 @@ function renderTiersEdit(title, tiers, fields, onSave) {
                         var va = +obj[fields[0].k], vb = +obj[fields[1].k];
                         if (isNaN(va) || isNaN(vb)) { toast("请填数字"); ui.post(render); return; }
                         t[fields[0].k] = va / (fields[0].scale || 1); t[fields[1].k] = vb;
-                        ui.post(render);
+                        persist("已更新"); ui.post(render);
                     });
                 }));
-                row.ctl.addView(buildActionChip("🗑", "#f6f4ef", function () {
-                    list.splice(i, 1); ui.post(render);
+                row.ctl.addView(buildActionChip("删除", "#f7eeeb", function () {
+                    list.splice(i, 1); persist("已删除"); ui.post(render);
                 }));
                 body.addView(row);
             });
         }
-        body.addView(buildPrimaryButton("+ 添加档位", "#1c1a17", function () {
+        if (footerBuilder) {
+            var fb = footerBuilder(render);
+            if (fb) body.addView(fb);
+        }
+        body.addView(buildSecondaryButton("+ 添加档位", function () {
             var pre = {}; pre[fields[0].k] = 5; pre[fields[1].k] = (fields[0].k === 'maxLoss' ? 10 : 8);
             cardForm("添加档位", fields.map(function (f) {
                 return { key: f.k, label: f.label, inputType: "number" };
@@ -1233,25 +1424,66 @@ function renderTiersEdit(title, tiers, fields, onSave) {
                 var va = +obj[fields[0].k], vb = +obj[fields[1].k];
                 if (isNaN(va) || isNaN(vb)) { toast("请填数字"); ui.post(render); return; }
                 var t = {}; t[fields[0].k] = va / (fields[0].scale || 1); t[fields[1].k] = vb;
-                list.push(t); ui.post(render);
+                list.push(t); persist("已添加"); ui.post(render);
             });
         }));
-        body.addView(buildPrimaryButton("✓ 完成保存", "#2e8b57", function () {
-            var key0 = fields[0].k;
-            list.sort(function (x, y) { return x[key0] - y[key0]; });
-            if (list.length) onSave(list);
-            toast("已保存 " + list.length + " 档");
-            ui.post(function () { renderConfig(); });
-        }));
+        // 即时持久化下每步已存盘,无单独「完成保存」按钮;离开本页用 header「‹」返回即可。
     }
     render();
+}
+
+// 降本兜底档页脚:亏损超过最深档时买入(独立开关 + 独立金额)。样式仿定投 allRow。
+// onRerender:就地重绘档位页回调(避免 toggle/保存后跳回配置页)。
+function renderCatchAllFooter(onRerender) {
+    var S = loadTradeConfig().strategies.costReduce;
+    var ca = S.catchAll || { enabled: false, amount: 20 };
+    var row = ui.inflate(
+        <vertical bg="#fffdf8" padding="14 13" margin="0 0 0 8">
+            <horizontal gravity="center_vertical">
+                <vertical layout_weight="1">
+                    <horizontal gravity="center_vertical">
+                        <text text="兜底档" textSize="14sp" textStyle="bold" textColor="#3d342a" />
+                        <text text="亏损∞" textSize="10sp" textStyle="bold" textColor="#8a6a2f" padding="6 2" margin="6 0 0 0" />
+                    </horizontal>
+                    <text id="sub" textSize="11sp" textColor="#8b857b" margin="0 2 0 0" />
+                </vertical>
+                <horizontal id="ctl" gravity="center_vertical" />
+            </horizontal>
+            <horizontal id="amtRow" gravity="center_vertical" margin="12 12 0 0" visibility="gone">
+                <text text="兜底金额" textSize="11sp" textColor="#a89e8a" layout_weight="1" />
+                <text id="amt" textSize="13sp" textStyle="bold" textColor="#3d342a" padding="12 7" gravity="center" />
+            </horizontal>
+        </vertical>);
+    row.setBackground(roundRect(ca.enabled ? "#efe9dc" : "#f6f4ef", 14, ca.enabled ? "#3d342a" : "#e0d8c6", ca.enabled ? 2 : 1));
+    row.sub.setText(ca.enabled ? "超过最深档时买入" : "未开启");
+    var tg = buildToggleChip(ca.enabled, function (en) {
+        saveStrategy('costReduce', { catchAll: { enabled: en, amount: ca.amount } });
+        toast("兜底档 " + (en ? "开" : "关"));
+        ui.post(onRerender);
+    });
+    row.ctl.addView(tg.view);
+    if (ca.enabled) {
+        row.amtRow.setVisibility(0);
+        row.amt.setText(ca.amount + " 元  ✎");
+        row.amt.setBackground(roundRect("#f6f4ef", 10, "#e0d8c6", 1));
+        row.amt.on("click", function () { row.amt.setAlpha(0.6);
+            cardInput("兜底金额(元)", "" + ca.amount, null, function (v) {
+                if (v != null && v !== "" && !isNaN(+v) && +v >= 1) {
+                    saveStrategy('costReduce', { catchAll: { enabled: ca.enabled, amount: +v } });
+                    toast("金额改为 " + (+v) + " 元");
+                }
+                ui.post(onRerender);
+            });
+        });
+    }
+    return row;
 }
 
 // 组别详情整页:组名 / 基金 / 定投 / 删除,行内操作。
 function renderGroupDetail(group, groups) {
     var body = startEditPage(group.name, (group.funds || []).length + " 只基金");
     body.addView(buildConfigSection("组名"));
-    var nmRow = buildConfigRow("名称", "点此重命名", group.name, "#1c1a17", function () {
+    var nmRow = buildConfigRow("名称", "点此重命名", group.name, "#3d342a", function () {
         cardInput("组别新名称", group.name, null, function (nm) {
             var name = (nm || "").trim();
             if (name) { group.name = name; saveTradeConfig({ groups: groups }); toast("已重命名为「" + name + "」"); }
@@ -1264,14 +1496,14 @@ function renderGroupDetail(group, groups) {
     var funds = group.funds || [];
     if (!funds.length) {
         var empty = ui.inflate(
-            <vertical bg="#fffdf8" padding="14 12" margin="0 0 0 8">
-                <text text="该组无基金" textSize="13sp" textColor="#8b857b" />
+            <vertical bg="#fffdf8" padding="16 14" margin="0 0 0 8" gravity="center_horizontal">
+                <text text="该组无基金" textSize="13sp" textColor="#8b857b" gravity="center" />
             </vertical>);
         empty.setBackground(roundRect("#fffdf8", 12, "#e7e1d4", 1));
         body.addView(empty);
     } else {
         funds.forEach(function (fn) {
-            body.addView(buildConfigRow(fn, "点此移出本组", "移除", "#c0392b", function () {
+            body.addView(buildConfigRow(fn, "点此移出本组", "移除", "#a8443a", function () {
                 confirmAsync("移除基金", "把「" + fn + "」移出「" + group.name + "」?", function (ok) {
                     if (ok) {
                         group.funds = funds.filter(function (n) { return n !== fn; });
@@ -1289,21 +1521,28 @@ function renderGroupDetail(group, groups) {
         <vertical bg="#fffdf8" padding="14 13" margin="0 0 0 8">
             <horizontal gravity="center_vertical">
                 <vertical layout_weight="1">
-                    <text text="本组定投" textSize="14sp" textStyle="bold" textColor="#1c1a17" />
+                    <text text="本组定投" textSize="14sp" textStyle="bold" textColor="#3d342a" />
                     <text id="sub" textSize="11sp" textColor="#8b857b" margin="0 2 0 0" />
                 </vertical>
                 <horizontal id="ctl" gravity="center_vertical" />
             </horizontal>
+            <horizontal id="amtRow" gravity="center_vertical" margin="12 12 0 0" visibility="gone">
+                <text text="定投金额" textSize="11sp" textColor="#a89e8a" layout_weight="1" />
+                <text id="amt" textSize="13sp" textStyle="bold" textColor="#3d342a" padding="12 7" gravity="center" />
+            </horizontal>
         </vertical>);
-    dcaRow.setBackground(roundRect(group.dcaEnabled ? "#efe9dc" : "#fffdf8", 12, group.dcaEnabled ? "#1c1a17" : "#e7e1d4", group.dcaEnabled ? 2 : 1));
-    dcaRow.sub.setText(group.dcaEnabled ? "每只买 " + group.dcaAmount + " 元" : "未开启");
+    dcaRow.setBackground(roundRect(group.dcaEnabled ? "#efe9dc" : "#fffdf8", 14, group.dcaEnabled ? "#3d342a" : "#e7e1d4", group.dcaEnabled ? 2 : 1));
+    dcaRow.sub.setText(group.dcaEnabled ? "组内每只基金各买一笔" : "未开启");
     dcaRow.ctl.addView(buildToggleChip(group.dcaEnabled, function (en) {
         group.dcaEnabled = en; saveTradeConfig({ groups: groups });
         toast("「" + group.name + "」定投 " + (en ? "开" : "关"));
         ui.post(function () { renderGroupDetail(group, groups); });
     }).view);
     if (group.dcaEnabled) {
-        dcaRow.ctl.addView(buildAmountChip(group.dcaAmount + "元", function () {
+        dcaRow.amtRow.setVisibility(0);
+        dcaRow.amt.setText(group.dcaAmount + " 元  ✎");
+        dcaRow.amt.setBackground(roundRect("#f6f4ef", 10, "#e0d8c6", 1));
+        dcaRow.amt.on("click", function () { dcaRow.amt.setAlpha(0.6);
             cardInput("「" + group.name + "」定投金额(元)", "" + group.dcaAmount, null, function (v) {
                 if (v != null && v !== "" && !isNaN(+v) && +v >= 1) {
                     group.dcaAmount = +v; saveTradeConfig({ groups: groups });
@@ -1311,11 +1550,11 @@ function renderGroupDetail(group, groups) {
                 }
                 ui.post(function () { renderGroupDetail(group, groups); });
             });
-        }));
+        });
     }
     body.addView(dcaRow);
 
-    body.addView(buildPrimaryButton("✕ 删除组别", "#c0392b", function () {
+    body.addView(buildPrimaryButton("✕ 删除组别", "#a8443a", function () {
         confirmAsync("删除组别", "删除「" + group.name + "」?组内基金不受影响。", function (ok) {
             if (ok) {
                 var gid = group.id;
@@ -1731,7 +1970,7 @@ function openRunPicker() {
     var meta = {
         base:       { side: '买', sub: '持仓 < 目标时补仓 · 全局', param: '目标 ' + S.base.target + '元 · 单次 ' + S.base.amount + '元' },
         dca:        { side: '买', sub: '每组各设金额,组内每只各买一笔', param: (S.dca.allEnabled ? '全部:' + S.dca.allAmount + '元' : '全部:关') + ' · ' + dcaGrpN + '组启用' },
-        costReduce: { side: '买', sub: '亏损时按档位加码 · 全局', param: (S.costReduce.tiers || []).map(function (t) { return (t.maxLoss * 100) + '%内→' + t.amount + '元'; }).join(' / ') || '无档位' },
+        costReduce: { side: '买', sub: '亏损时按档位加码 · 全局', param: ((S.costReduce.tiers || []).map(function (t) { return (t.maxLoss * 100) + '%内→' + t.amount + '元'; }).join(' / ') || '无档位') + (S.costReduce.catchAll && S.costReduce.catchAll.enabled ? ' / 兜底→' + S.costReduce.catchAll.amount + '元' : '') },
         takeProfit: { side: '卖', sub: '收益率达档位卖等比份额 · 全局', param: (S.takeProfit.tiers || []).map(function (t) { return (t.minRate * 100) + '%→1/' + t.ratio; }).join(' / ') || '无档位' }
     };
     var order = ['base', 'dca', 'costReduce', 'takeProfit'];
@@ -1760,12 +1999,16 @@ function runStrategy(onlyKeys) {
     threads.start(function () {
         var myPkg = currentPackage();
         var cfg = loadTradeConfig();
-        var summary = { buy: 0, sell: 0, ok: 0, fail: 0, skip: 0, detail: [] };
+        var summary = { ts: new Date().getTime(), mode: cfg.dryRun ? '模拟' : '真实', buy: 0, sell: 0, ok: 0, fail: 0, skip: 0, detail: [] };
         openFloaty("策略引擎");
         try {
             // 1. 采集
             status("采集中…");
             var data = collectFunds();
+            // 基金快照(供报告关联收益率/持仓金额)
+            summary.fundMap = {};
+            (data.funds || []).forEach(function (f) { summary.fundMap[f.name] = f; });
+            summary.hdr = data.hdr || {};
             // 2. 生成计划(只对启用的模板;onlyKeys 进一步收窄本次执行范围)
             var buys = planBuys(data.funds, cfg.strategies, cfg.groups, onlyKeys);
             var sells = planSells(data.funds, cfg.strategies, onlyKeys);
@@ -1777,7 +2020,7 @@ function runStrategy(onlyKeys) {
                 idx++;
                 status("[" + idx + "/" + total + "] 卖 " + o.name + " (止盈)");
                 var r = sell({ name: o.name, ratio: o.ratio, dryRun: cfg.dryRun });
-                summary.detail.push({ a: 'sell', name: o.name, s: r.status, m: r.msg });
+                summary.detail.push({ a: 'sell', name: o.name, s: r.status, m: r.msg, strat: '止盈', ratio: o.ratio });
                 status(r.ok ? "✅ " + r.status : "❌ " + (r.msg || r.status), r.ok ? "#2e8b57" : "#c0392b");
                 if (r.status === 'skipped') summary.skip++; else if (r.ok) summary.ok++; else summary.fail++;
             });
@@ -1785,7 +2028,7 @@ function runStrategy(onlyKeys) {
                 idx++;
                 status("[" + idx + "/" + total + "] 买 " + o.name + " " + o.amount + "元 (" + stratLabel(o.strategy) + ")");
                 var r = buy({ name: o.name, amount: o.amount, dryRun: cfg.dryRun });
-                summary.detail.push({ a: 'buy', name: o.name, s: r.status, m: r.msg });
+                summary.detail.push({ a: 'buy', name: o.name, s: r.status, m: r.msg, amt: o.amount, strat: stratLabel(o.strategy) });
                 status(r.ok ? "✅ " + r.status : "❌ " + (r.msg || r.status), r.ok ? "#2e8b57" : "#c0392b");
                 if (r.ok) summary.ok++; else summary.fail++;
             });
@@ -1794,13 +2037,29 @@ function runStrategy(onlyKeys) {
             status("完成:成交 " + summary.ok + " / 失败 " + summary.fail + " / 跳过 " + summary.skip, "#2e8b57");
         } catch (e) {
             console.log("STRAT 异常 " + e);
+            summary.err = String(e);
             status("❌ 策略异常: " + e, "#c0392b");
             ui.post(function () { toast("❌ 策略引擎异常: " + e); });
         }
         ui.post(function () { toast("策略完成: 成交 " + summary.ok + " / 失败 " + summary.fail + " / 跳过 " + summary.skip); });
-        sleep(2000);
-        try { app.launchPackage(myPkg); } catch (e) {}
+        sleep(1500);
         closeFloaty();
+        // 切回本 App:模拟运行后停在支付宝密码页,单次 launchPackage 易被 MIUI 拦截 → 多重重试 + 验证
+        var back = false;
+        for (var k = 0; k < 8; k++) {
+            try { app.launchPackage(myPkg); } catch (e) {}
+            sleep(700);
+            if (currentPackage() === myPkg) { back = true; break; }
+        }
+        if (!back) {
+            ui.post(function () { toast("策略完成,请手动切回本 App 查看报告"); });
+            return;
+        }
+        sleep(400);  // 等界面稳定到前台后再 inflate(后台 inflate 易致 view 绑定失败)
+        // 切回成功(前台)后弹出运行报告卡片
+        ui.post(function () {
+            try { cardReport(summary); } catch (ex) { console.log("报告卡片异常 " + ex + "\n" + (ex && ex.stack ? ex.stack : "")); }
+        });
     });
 }
 
@@ -1810,12 +2069,12 @@ ui.layout(
         <vertical bg="#f6f4ef">
             <horizontal bg="#fffdf8" padding="16 14" gravity="center_vertical">
                 <vertical layout_weight="1">
-                    <text text="支付宝 · 基金持仓" textColor="#1c1a17" textSize="15sp" textStyle="bold" />
+                    <text text="支付宝 · 基金持仓" textColor="#3d342a" textSize="15sp" textStyle="bold" />
                     <text id="meta" text="点右上角刷新按钮获取数据" textColor="#8b857b" textSize="11sp" />
                 </vertical>
-                <button id="cfg" w="36" h="36" text="⚙" textColor="#1c1a17" textSize="20sp" gravity="center" margin="0 0 0 8" padding="0" />
-                <button id="runBtn" w="36" h="36" text="▶" textColor="#1c1a17" textSize="16sp" gravity="center" margin="0 0 0 6" padding="0" />
-                <button id="btn" w="36" h="36" text="↻" textColor="#1c1a17" textSize="26sp" gravity="center|top" margin="0 0 0 6" padding="0" />
+                <button id="cfg" w="36" h="36" text="⚙" textColor="#3d342a" textSize="20sp" gravity="center" margin="0 0 0 8" padding="0" />
+                <button id="runBtn" w="36" h="36" text="▶" textColor="#3d342a" textSize="16sp" gravity="center" margin="0 0 0 6" padding="0" />
+                <button id="btn" w="36" h="36" text="↻" textColor="#3d342a" textSize="26sp" gravity="center|top" margin="0 0 0 6" padding="0" />
             </horizontal>
             <scroll layout_weight="1">
                 <vertical>
@@ -1847,7 +2106,7 @@ function applyQuerySort(funds, q, key, dir) {
 
 function styleChip(v, active) {
     // 默认:纸面 + 描边 + 灰字;激活:淡灰褐印章 + 深墨字
-    v.setTextColor(COL(active ? "#1c1a17" : "#8b857b"));
+    v.setTextColor(COL(active ? "#3d342a" : "#8b857b"));
     v.setBackground(roundRect(active ? "#efe9dc" : "#fffdf8", 12, "#e7e1d4", 1));
 }
 
@@ -1855,7 +2114,7 @@ function styleChip(v, active) {
 function buildToolbar() {
     var bar = ui.inflate(
         <vertical margin="0 6 0 12">
-            <input id="qbox" hint="搜索基金名称…" textSize="13sp" textColor="#1c1a17" padding="12 11" margin="0 0 0 8" />
+            <input id="qbox" hint="搜索基金名称…" textSize="13sp" textColor="#3d342a" padding="12 11" margin="0 0 0 8" />
             <horizontal id="chips" gravity="center_vertical" />
         </vertical>);
     bar.qbox.setBackground(roundRect("#fffdf8", 12, "#e7e1d4", 1));
@@ -1893,10 +2152,10 @@ function renderList(d) {
         rows.forEach(function (f) {
             var card = ui.inflate(
                 <vertical bg="#fffdf8" padding="13" margin="0 0 0 8">
-                    <text id="nm" textSize="13sp" textStyle="bold" textColor="#1c1a17" />
+                    <text id="nm" textSize="13sp" textStyle="bold" textColor="#3d342a" />
                     <text id="tg" textSize="10sp" textColor="#8b857b" />
                     <horizontal margin="0 8 0 0" gravity="center_vertical">
-                        <text id="am" layout_weight="1" textSize="17sp" textStyle="bold" textColor="#1c1a17" />
+                        <text id="am" layout_weight="1" textSize="17sp" textStyle="bold" textColor="#3d342a" />
                         <text id="rt" textSize="14sp" textStyle="bold" />
                     </horizontal>
                     <horizontal margin="0 4 0 0">
@@ -1961,7 +2220,7 @@ function render(d) {
     var hero = ui.inflate(
         <vertical margin="0 2 0 14">
             <text text="总金额" textColor="#8b857b" textSize="11sp" />
-            <text id="ht" textSize="38sp" textStyle="bold" textColor="#1c1a17" />
+            <text id="ht" textSize="38sp" textStyle="bold" textColor="#3d342a" />
             <text id="hy" textSize="14sp" textStyle="bold" margin="0 8 0 0" />
         </vertical>);
     if (h.total != null) hero.ht.setText(money(h.total));
