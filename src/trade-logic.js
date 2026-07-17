@@ -2,6 +2,9 @@
 
 /** 护栏校验(白名单已移除,改由组别/策略作用范围控制) */
 function checkGuard(o) {
+    if (typeof o.amount !== 'number' || isNaN(o.amount)) return { ok: false, needConfirm: false, reason: '金额非数字' };
+    var dec = ("" + o.amount).split('.')[1];
+    if (dec && dec.length > 2) return { ok: false, needConfirm: false, reason: '金额小数超过2位:' + o.amount };
     if (!o.amount || o.amount < 1) return { ok: false, needConfirm: false, reason: '金额必须 >=1.00' };
     if (o.amount > o.maxAmount) return { ok: false, needConfirm: false, reason: '金额 ' + o.amount + ' 超上限 ' + o.maxAmount };
     var needConfirm = o.confirmThreshold != null && o.amount > o.confirmThreshold;

@@ -10,6 +10,12 @@ assert.deepStrictEqual(checkGuard({ name: 'A', amount: 100, maxAmount: 5000, con
 assert.strictEqual(checkGuard({ name: 'A', amount: 6000, maxAmount: 5000, confirmThreshold: 1000 }).ok, false);
 assert.strictEqual(checkGuard({ name: 'A', amount: 2000, maxAmount: 5000, confirmThreshold: 1000 }).needConfirm, true);
 assert.strictEqual(checkGuard({ name: 'A', amount: 0.5, maxAmount: 5000, confirmThreshold: 1000 }).ok, false);
+// 小数精度:整数与 ≤2 位小数放行;>2 位小数 / 非数字拒绝(防传到支付宝才被拒)
+assert.strictEqual(checkGuard({ name: 'A', amount: 10, maxAmount: 5000, confirmThreshold: 1000 }).ok, true);      // 整数
+assert.strictEqual(checkGuard({ name: 'A', amount: 10.5, maxAmount: 5000, confirmThreshold: 1000 }).ok, true);    // 1 位小数
+assert.strictEqual(checkGuard({ name: 'A', amount: 10.55, maxAmount: 5000, confirmThreshold: 1000 }).ok, true);   // 2 位小数
+assert.strictEqual(checkGuard({ name: 'A', amount: 10.123, maxAmount: 5000, confirmThreshold: 1000 }).ok, false); // 3 位小数 → 拒
+assert.strictEqual(checkGuard({ name: 'A', amount: '10', maxAmount: 5000, confirmThreshold: 1000 }).ok, false);   // 字符串 → 拒
 
 // ratioToShares
 assert.strictEqual(ratioToShares(1 / 8, 1000), 125);

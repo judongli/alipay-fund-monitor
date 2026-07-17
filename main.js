@@ -105,6 +105,9 @@ function status(msg, dotColor) {
 // ---------- 交易纯逻辑(@sync src/trade-logic.js,改动两处同步)----------
 // 护栏校验(白名单已移除,改由组别/策略作用范围控制)
 function checkGuard(o) {
+    if (typeof o.amount !== 'number' || isNaN(o.amount)) return { ok: false, needConfirm: false, reason: '金额非数字' };
+    var dec = ("" + o.amount).split('.')[1];
+    if (dec && dec.length > 2) return { ok: false, needConfirm: false, reason: '金额小数超过2位:' + o.amount };
     if (!o.amount || o.amount < 1) return { ok: false, needConfirm: false, reason: '金额必须 >=1.00' };
     if (o.amount > o.maxAmount) return { ok: false, needConfirm: false, reason: '金额 ' + o.amount + ' 超上限 ' + o.maxAmount };
     var needConfirm = o.confirmThreshold != null && o.amount > o.confirmThreshold;
@@ -1669,7 +1672,7 @@ function loadData() { try { if (files.exists(DATA_FILE)) return JSON.parse(files
 
 // ---------- 交易层(buy/sell,本轮)----------
 var UI = {
-    BTN_BUY: "买入", BTN_SELL: "卖出", BTN_CONFIRM: /确\s*定|确认支付|确认/,
+    BTN_BUY: "买入", BTN_SELL: "卖出", BTN_CONFIRM: /^确\s*定$|^确认支付$|^确认$/, // 锚定:仅 exact 匹配 确定/确认支付/确认,不误中"确认协议""我已确认"等残留标签
     FUND_CODE_RE: /^\d{6}$/,
     SELL_CONVERT_DISMISS: "仍要卖出",
     SELL_MAX_RE: /最多可卖出([\d.]+)份/,
