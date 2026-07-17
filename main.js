@@ -867,6 +867,11 @@ function renderConfig() {
         });
     body.addView(sellCard);
 
+    var realTestCard = buildConfigRow("🧪 真实测试(1元)", "真实买入 1元基金 验证连续支付 · 与持仓取交",
+        "▶ " + REAL_TEST_MAX + "只/" + (REAL_TEST_MAX * REAL_TEST_AMOUNT) + "元", "#a8443a",
+        function () { openRealTestConfirm(); });
+    body.addView(realTestCard);
+
     // 页脚说明
     var foot = ui.inflate(
         <text text="配置存储于本地 storages · 密码经 Android Keystore 加密&#10;点策略卡配参数 · 点右侧「启用/停用」切换"
@@ -1948,6 +1953,63 @@ function runSell(name, shares) {
         sleep(1500);
         try { app.launchPackage(myPkg); } catch (e) {}
         closeFloaty();
+    });
+}
+
+// ---------- 真实测试(1元):验证真实支付多基金连续操作 ----------
+// 复用已验证的 buy(),仅 dryRun:false + amount:1 循环。安全边界靠结构保证:
+//   金额恒定 1 元;min>1 的基金会被支付宝拒(buy 成功检测不到成交页 → 抛错 → 审计 → 跳过),超购不可能。
+// 1元起购基金清单由 probe-minbuy.js 探针扫出(2026-07-18,42只里7只1元起购)。
+var REAL_TEST_FUNDS = [
+    "天弘中证红利低波动100ETF联接C",
+    "天弘中证高端装备制造指数增强E",
+    "银华中证创新药产业ETF联接A",
+    "华泰柏瑞中证红利低波动ETF联接C",
+    "华夏中证大数据产业ETF联接A",
+    "国泰黄金ETF联接A",
+    "民生加银中证内地资源主题指数A",
+];
+var REAL_TEST_AMOUNT = 1;    // 每只买入金额(元) — 恒定 1,改动即失去最小代价安全边界
+var REAL_TEST_MAX = 7;       // 全测 7 只(3只已 2026-07-18 验证全绿,现跑全集连续验证)
+function openRealTestConfirm() {
+    if (!secretStore.has()) { toast("未设置支付密码,无法真实下单"); return; }
+    var data = loadData();
+    var held = data && data.funds ? data.funds.map(function (f) { return f.name; }) : [];
+    var list = REAL_TEST_FUNDS.filter(function (n) { return held.indexOf(n) >= 0; }).slice(0, REAL_TEST_MAX);
+    if (!list.length) { toast("未匹配到测试基金,先点 ↻ 采集一次"); return; }
+    var total = list.length * REAL_TEST_AMOUNT;
+    cardConfirm("真实买入确认",
+        "真实买入 " + list.length + " 只 × " + REAL_TEST_AMOUNT + " 元 = " + total + " 元\n\n" +
+        list.join("\n") + "\n\n真实扣款 · 不可撤销,确认执行?",
+        function (ok) { if (ok) runRealTest(list); });
+}
+function runRealTest(list) {
+    threads.start(function () {
+        var myPkg = currentPackage();
+        var summary = { ts: new Date().getTime(), mode: '真实', ok: 0, fail: 0, skip: 0, detail: [] };
+        openFloaty("真实测试");
+        try {
+            list.forEach(function (name, i) {
+                status("[" + (i + 1) + "/" + list.length + "] 真实买入 " + name + " " + REAL_TEST_AMOUNT + "元");
+                var r = buy({ name: name, amount: REAL_TEST_AMOUNT, dryRun: false });
+                summary.detail.push({ a: 'buy', name: name, s: r.status, m: r.msg, amt: REAL_TEST_AMOUNT, strat: '真实测试' });
+                status(r.ok ? "✅ " + r.status : "❌ " + (r.msg || r.status), r.ok ? "#2e8b57" : "#c0392b");
+                if (r.ok) summary.ok++; else summary.fail++;
+            });
+            appendAudit(JSON.stringify({ ts: new Date().getTime(), action: 'real_test_batch', n: list.length, amount: REAL_TEST_AMOUNT, ok: summary.ok, fail: summary.fail }));
+            status("完成:成交 " + summary.ok + " / 失败 " + summary.fail, "#2e8b57");
+        } catch (e) {
+            summary.err = String(e);
+            status("❌ 真实测试异常: " + e, "#c0392b");
+            ui.post(function () { toast("❌ 真实测试异常: " + e); });
+        }
+        ui.post(function () { toast("真实测试完成: 成交 " + summary.ok + " / 失败 " + summary.fail); });
+        sleep(1500); closeFloaty();
+        var back = false;
+        for (var k = 0; k < 8; k++) { try { app.launchPackage(myPkg); } catch (e) {} sleep(700); if (currentPackage() === myPkg) { back = true; break; } }
+        sleep(400);
+        if (back) ui.post(function () { try { cardReport(summary); } catch (ex) { console.log("报告异常 " + ex); } });
+        else ui.post(function () { toast("真实测试完成,请手动切回本 App 查看报告"); });
     });
 }
 
