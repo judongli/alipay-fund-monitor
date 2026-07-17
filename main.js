@@ -1396,15 +1396,27 @@ function renderTiersEdit(title, tiers, fields, onSave, footerBuilder) {
             body.addView(tip);
         } else {
             list.forEach(function (t, i) {
+                var en = t.enabled !== false;
                 var row = ui.inflate(
                     <vertical bg="#fffdf8" padding="14 13" margin="0 0 0 8">
                         <horizontal gravity="center_vertical">
+                            <text id="dot" textSize="15sp" padding="0 0 8 0" />
                             <text id="lab" textSize="13sp" textStyle="bold" textColor="#3d342a" layout_weight="1" />
                             <horizontal id="ctl" gravity="center_vertical" />
                         </horizontal>
                     </vertical>);
-                row.setBackground(roundRect("#fffdf8", 12, "#e7e1d4", 1));
+                row.setBackground(roundRect(en ? "#fffdf8" : "#f6f4ef", 12, en ? "#e7e1d4" : "#ece4d3", 1));
+                row.dot.setText(en ? "●" : "○");
+                row.dot.setTextColor(COL(en ? "#3d342a" : "#b8b1a6"));
                 row.lab.setText(fmt(t));
+                row.lab.setTextColor(COL(en ? "#3d342a" : "#a89e8a"));
+                var toggle = function () {
+                    t.enabled = !en;
+                    persist("已" + (en ? "停用" : "启用"));
+                    ui.post(render);
+                };
+                row.dot.on("click", function () { row.dot.setAlpha(0.5); toggle(); });
+                row.lab.on("click", function () { row.lab.setAlpha(0.6); toggle(); });
                 row.ctl.addView(buildActionChip("编辑", "#f6f4ef", function () {
                     var pre = {}; pre[fields[0].k] = t[fields[0].k] * (fields[0].scale || 1); pre[fields[1].k] = t[fields[1].k];
                     cardForm("编辑档位", fields.map(function (f) {
@@ -1433,7 +1445,7 @@ function renderTiersEdit(title, tiers, fields, onSave, footerBuilder) {
             }), pre, function (obj) {
                 var va = +obj[fields[0].k], vb = +obj[fields[1].k];
                 if (isNaN(va) || isNaN(vb)) { toast("请填数字"); ui.post(render); return; }
-                var t = {}; t[fields[0].k] = va / (fields[0].scale || 1); t[fields[1].k] = vb;
+                var t = {}; t[fields[0].k] = va / (fields[0].scale || 1); t[fields[1].k] = vb; t.enabled = true;
                 list.push(t); persist("已添加"); ui.post(render);
             });
         }));
