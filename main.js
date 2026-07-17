@@ -808,7 +808,7 @@ function renderConfig() {
     var crCatchAll = (S.costReduce.catchAll && S.costReduce.catchAll.enabled)
         ? " / 兜底→" + S.costReduce.catchAll.amount + "元" : "";
     stratRows.addView(buildStrategyCard("降本", "亏损时买入,按亏损档位加码(全局)",
-        (S.costReduce.tiers.map(function (t) { return (t.maxLoss * 100) + "%内→" + t.amount + "元"; }).join(" / ") || "无档位") + crCatchAll, S.costReduce.enabled, function (en) {
+        (S.costReduce.tiers.map(function (t) { return (t.maxLoss * 100) + "%内→" + t.amount + "元" + (t.enabled === false ? " 停" : ""); }).join(" / ") || "无档位") + crCatchAll, S.costReduce.enabled, function (en) {
             saveStrategy('costReduce', { enabled: en });
         }, function () {
             safeRender("降本档位", function () {
@@ -825,7 +825,7 @@ function renderConfig() {
     stratRows.addView(relTag3);
 
     stratRows.addView(buildStrategyCard("止盈", "收益率达档位卖等比份额(全局)",
-        S.takeProfit.tiers.map(function (t) { return (t.minRate * 100) + "%→1/" + t.ratio; }).join(" / ") || "无档位", S.takeProfit.enabled, function (en) {
+        S.takeProfit.tiers.map(function (t) { return (t.minRate * 100) + "%→1/" + t.ratio + (t.enabled === false ? " 停" : ""); }).join(" / ") || "无档位", S.takeProfit.enabled, function (en) {
             saveStrategy('takeProfit', { enabled: en });
         }, function () {
             safeRender("止盈档位", function () {
@@ -2049,8 +2049,8 @@ function openRunPicker() {
     var meta = {
         base:       { side: '买', sub: '持仓 < 目标时补仓 · 全局', param: '目标 ' + S.base.target + '元 · 单次 ' + S.base.amount + '元' },
         dca:        { side: '买', sub: '每组各设金额,组内每只各买一笔', param: (S.dca.allEnabled ? '全部:' + S.dca.allAmount + '元' : '全部:关') + ' · ' + dcaGrpN + '组启用' },
-        costReduce: { side: '买', sub: '亏损时按档位加码 · 全局', param: ((S.costReduce.tiers || []).map(function (t) { return (t.maxLoss * 100) + '%内→' + t.amount + '元'; }).join(' / ') || '无档位') + (S.costReduce.catchAll && S.costReduce.catchAll.enabled ? ' / 兜底→' + S.costReduce.catchAll.amount + '元' : '') },
-        takeProfit: { side: '卖', sub: '收益率达档位卖等比份额 · 全局', param: (S.takeProfit.tiers || []).map(function (t) { return (t.minRate * 100) + '%→1/' + t.ratio; }).join(' / ') || '无档位' }
+        costReduce: { side: '买', sub: '亏损时按档位加码 · 全局', param: ((S.costReduce.tiers || []).map(function (t) { return (t.maxLoss * 100) + '%内→' + t.amount + '元' + (t.enabled === false ? ' 停' : ''); }).join(' / ') || '无档位') + (S.costReduce.catchAll && S.costReduce.catchAll.enabled ? ' / 兜底→' + S.costReduce.catchAll.amount + '元' : '') },
+        takeProfit: { side: '卖', sub: '收益率达档位卖等比份额 · 全局', param: (S.takeProfit.tiers || []).map(function (t) { return (t.minRate * 100) + '%→1/' + t.ratio + (t.enabled === false ? ' 停' : ''); }).join(' / ') || '无档位' }
     };
     var order = ['base', 'dca', 'costReduce', 'takeProfit'];
     var items = order.map(function (k) {
