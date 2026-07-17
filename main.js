@@ -1987,7 +1987,7 @@ var REAL_TEST_FUNDS = [
     "民生加银中证内地资源主题指数A",
 ];
 var REAL_TEST_AMOUNT = 1;    // 每只买入金额(元) — 恒定 1,改动即失去最小代价安全边界
-var REAL_TEST_MAX = 7;       // 全测 7 只(3只已 2026-07-18 验证全绿,现跑全集连续验证)
+var REAL_TEST_MAX = 2;       // 回归测 2 只即可(BTN_CONFIRM 收紧后真机回归,2元)
 function openRealTestConfirm() {
     if (!secretStore.has()) { toast("未设置支付密码,无法真实下单"); return; }
     var data = loadData();
