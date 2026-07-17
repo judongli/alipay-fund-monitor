@@ -3,5 +3,6 @@
   "main": "main.js",
   "versionName": "0.1.0",
   "versionCode": 1,
+  "icon": "res/logo.png",
   "ignore": ["data/*", "*.md"]
 }
