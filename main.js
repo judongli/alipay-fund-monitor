@@ -165,7 +165,7 @@ function planBuys(funds, S, groups, onlyKeys) {
         if (allow('costReduce') && S.costReduce && S.costReduce.enabled && f.rate != null && f.rate < 0) {
             var tier = null;
             var crTiers = (S.costReduce.tiers || []).slice().sort(function (a, b) { return a.maxLoss - b.maxLoss; });
-            crTiers.forEach(function (t) { if (!tier && f.rate >= -t.maxLoss) tier = t; });
+            crTiers.forEach(function (t) { if (!tier && t.enabled !== false && f.rate >= -t.maxLoss) tier = t; });
             // 兜底档:普通档都不命中(亏损超过最深档;空 tiers 时任意亏损)→ 启用则用兜底金额
             var catchAll = S.costReduce.catchAll;
             if (!tier && catchAll && catchAll.enabled && catchAll.amount >= 1) {
@@ -206,7 +206,9 @@ function planSells(funds, S, onlyKeys) {
         var tier = null;
         // tiers 自动按 minRate 升序(收益低→高),遍历取最后命中即最高匹配档
         var tpTiers = (S.takeProfit.tiers || []).slice().sort(function (a, b) { return a.minRate - b.minRate; });
-        tpTiers.forEach(function (t) { if (f.rate >= t.minRate) tier = t; });
+        tpTiers.forEach(function (t) {
+            if (f.rate >= t.minRate && t.enabled !== false) tier = t;  // 跳过禁用档,取最高启用命中档
+        });
         if (tier) orders.push({ name: f.name, ratio: 1 / tier.ratio, strategy: 'takeProfit' });
     });
     return orders;
