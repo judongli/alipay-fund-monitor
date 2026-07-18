@@ -30,6 +30,8 @@ function hexOf(n) { return n > 0 ? "#c0392b" : (n < 0 ? "#2e8b57" : "#8b857b"); 
 
 // ---------- 悬浮窗(浮在支付宝上方,实时显示当前操作进度)----------
 var fw = null, fx = 0, fy = 0, pulse = null;
+// 策略运行控制只在单笔操作之间生效，避免把支付宝提交过程停在半途中。
+var activeRunControl = null;
 // 心跳:进行中红点缓慢呼吸;终态(完成/出错/切回)停心跳、定色
 function startPulse() {
     if (!fw || pulse) return;
@@ -46,8 +48,14 @@ function stopPulse() {
     if (fw) { try { fw.dot.clearAnimation(); } catch (e) {} }
 }
 // title:小标题(采集进度 / 交易进度 / 策略引擎);op:当前步骤
-function openFloaty(title) {
-    if (fw) { try { fw.title.setText(title || "进度"); } catch (e) {} return; }
+function openFloaty(title, controllable) {
+    if (fw) {
+        try {
+            fw.title.setText(title || "进度");
+            fw.controls.setVisibility(controllable ? 0 : 8);
+        } catch (e) {}
+        return;
+    }
     try { fw = floaty.window(
         <frame>
             <vertical id="card" bg="#fffdf8" w="246" padding="14 11" margin="12">
@@ -56,6 +64,10 @@ function openFloaty(title) {
                     <text id="title" text="进度" textColor="#8b857b" textSize="10sp" />
                 </horizontal>
                 <text id="op" text="准备中…" textColor="#3d342a" textSize="13sp" textStyle="bold" margin="0 4 0 0" />
+                <horizontal id="controls" visibility="gone" margin="0 9 0 0">
+                    <text id="pauseBtn" text="Ⅱ 暂停" textColor="#6a645a" textSize="11sp" textStyle="bold" gravity="center" padding="10 7" layout_weight="1" margin="0 0 4 0" />
+                    <text id="stopBtn" text="■ 终止" textColor="#a8443a" textSize="11sp" textStyle="bold" gravity="center" padding="10 7" layout_weight="1" margin="4 0 0 0" />
+                </horizontal>
             </vertical>
         </frame>
     ); } catch (e) { console.log("悬浮窗创建失败: " + e); fw = null; return; }
@@ -63,6 +75,11 @@ function openFloaty(title) {
         fw.card.setBackground(roundRect("#fffdf8", 14, "#e7e1d4", 1));
         fw.title.setText(title || "进度");
         fw.op.setMaxLines(2);
+        fw.controls.setVisibility(controllable ? 0 : 8);
+        fw.pauseBtn.setBackground(roundRect("#f0ebe0", 8, "#e1d9ca", 1));
+        fw.stopBtn.setBackground(roundRect("#fbeceb", 8, "#e9c8c4", 1));
+        fw.pauseBtn.on("click", function () { requestRunStop('paused'); });
+        fw.stopBtn.on("click", function () { requestRunStop('terminated'); });
         var dm = context.getResources().getDisplayMetrics();
         fx = Math.floor((dm.widthPixels - 270 * dm.density) / 2); fy = 140; // 顶部居中(270dp = 卡片+边距)
         fw.setPosition(fx, fy);
@@ -73,6 +90,21 @@ function openFloaty(title) {
         var set = new android.view.animation.AnimationSet(false); set.addAnimation(ea); set.addAnimation(es); set.setDuration(300); set.setInterpolator(new android.view.animation.DecelerateInterpolator());
         fw.card.startAnimation(set);
     } catch (e) { console.log("悬浮窗样式失败: " + e); }
+}
+function requestRunStop(kind) {
+    if (!activeRunControl || activeRunControl.requested) return;
+    activeRunControl.requested = kind;
+    var lab = kind === 'paused' ? '暂停' : '终止';
+    status("已请求" + lab + "，当前操作完成后停止…", "#b0704a");
+    try {
+        if (fw) {
+            fw.pauseBtn.setEnabled(false); fw.stopBtn.setEnabled(false);
+            fw.pauseBtn.setAlpha(0.45); fw.stopBtn.setAlpha(0.45);
+        }
+    } catch (e) {}
+}
+function hideRunControls() {
+    ui.post(function () { try { if (fw) fw.controls.setVisibility(8); } catch (e) {} });
 }
 function closeFloaty() {
     if (!fw) return;
@@ -332,6 +364,103 @@ function loadTradeConfig() {
 function saveTradeConfig(o) { Object.keys(o).forEach(function (k) { cfgStore.put(k, o[k]); }); }
 function openConfigUI() { renderConfig(); }
 
+// ---------- 运行历史(@sync src/run-history.js,改动两处同步) ----------
+// 每次策略运行保存完整批次；最多保留 100 次。activeRunId 指向可续跑的未完成批次。
+var runStore = storages.create("fund_trade_runs");
+var RUN_HISTORY_LIMIT = 100;
+function createRunRecord(o) {
+    o = o || {};
+    var ts = o.ts || new Date().getTime();
+    return {
+        id: o.id || ('run_' + ts), ts: ts, updatedAt: ts, endedAt: null,
+        status: 'running', incomplete: true, resumable: true, phase: 'collecting',
+        mode: o.mode || '模拟', strategyKeys: (o.strategyKeys || []).slice(), config: o.config || null,
+        buy: 0, sell: 0, ok: 0, fail: 0, skip: 0,
+        nextIndex: 0, currentIndex: null, plan: [], detail: [], fundMap: {}, hdr: {}
+    };
+}
+function recalcRunStats(run) {
+    var ok = 0, fail = 0, skip = 0;
+    (run.detail || []).forEach(function (d) {
+        if (d.s === 'skipped') skip++;
+        else if (d.s === 'ok' || d.s === 'dry_run_stopped_at_pwd') ok++;
+        else fail++;
+    });
+    run.ok = ok; run.fail = fail; run.skip = skip;
+    return run;
+}
+function canResumeRun(run) {
+    return !!(run && run.incomplete && run.resumable !== false &&
+        ['running', 'interrupted', 'paused', 'terminated', 'failed'].indexOf(run.status) >= 0);
+}
+function loadRunHistory() {
+    var rows = runStore.contains('runs') ? runStore.get('runs') : [];
+    return rows && typeof rows.slice === 'function' ? rows : [];
+}
+function saveRunRecord(run) {
+    run.updatedAt = new Date().getTime();
+    var rows = loadRunHistory(), found = false;
+    rows = rows.map(function (x) {
+        if (x && x.id === run.id) { found = true; return run; }
+        return x;
+    });
+    if (!found) rows.unshift(run);
+    rows.sort(function (a, b) { return (b.ts || 0) - (a.ts || 0); });
+    runStore.put('runs', rows.slice(0, RUN_HISTORY_LIMIT));
+    if (canResumeRun(run)) runStore.put('activeRunId', run.id);
+    else if (runStore.get('activeRunId') === run.id) runStore.remove('activeRunId');
+    return run;
+}
+function findRunById(id) {
+    var found = null;
+    loadRunHistory().some(function (r) { if (r && r.id === id) { found = r; return true; } return false; });
+    return found;
+}
+function getResumableRun() {
+    var id = runStore.get('activeRunId');
+    var run = id ? findRunById(id) : null;
+    if (canResumeRun(run)) return run;
+    var rows = loadRunHistory();
+    for (var i = 0; i < rows.length; i++) if (canResumeRun(rows[i])) return rows[i];
+    return null;
+}
+function abandonRun(run) {
+    if (!run) return;
+    run.resumable = false;
+    run.incomplete = true; // 历史中仍明确保留“未完成”，只是不再提示续跑。
+    saveRunRecord(run);
+}
+function recoverInterruptedRun(run, ts) {
+    if (!run || run.status !== 'running') return run;
+    run.status = 'interrupted'; run.incomplete = true; run.resumable = true;
+    run.endedAt = ts || new Date().getTime(); run.updatedAt = run.endedAt;
+    // 进程若消失在某笔交易中，无法安全判断是否已受理。跳过该笔，防止续跑重复下单。
+    if (run.currentIndex != null && run.plan && run.plan[run.currentIndex] && run.plan[run.currentIndex].state === 'executing') {
+        var o = run.plan[run.currentIndex];
+        o.state = 'unknown';
+        run.detail = run.detail || [];
+        run.detail.push({ a: o.a, name: o.name, s: 'unknown_interrupted', m: '运行中断，交易结果需在支付宝核对', amt: o.amt, ratio: o.ratio, strat: o.strat });
+        run.nextIndex = run.currentIndex + 1; run.currentIndex = null;
+        recalcRunStats(run);
+    }
+    return run;
+}
+function recoverStaleRuns() {
+    var rows = loadRunHistory(), changed = false, now = new Date().getTime();
+    rows.forEach(function (r) { if (r && r.status === 'running') { recoverInterruptedRun(r, now); changed = true; } });
+    if (changed) {
+        runStore.put('runs', rows);
+        var active = rows.filter(function (r) { return canResumeRun(r); })[0];
+        if (active) runStore.put('activeRunId', active.id);
+    }
+}
+var RUN_STATUS = {
+    running: { label: '运行中', color: '#8a6a2f' }, completed: { label: '已完成', color: '#2e8b57' },
+    paused: { label: '已暂停 · 未完成', color: '#b0704a' }, terminated: { label: '已终止 · 未完成', color: '#a8443a' },
+    interrupted: { label: '意外中断 · 未完成', color: '#a8443a' }, failed: { label: '异常 · 未完成', color: '#c0392b' }
+};
+function runStatusMeta(run) { return RUN_STATUS[run && run.status] || { label: (run && run.status) || '未知', color: '#8b857b' }; }
+
 // ---------- 浮层卡片对话框(替代原生 dialogs.* 小白框,纸感风格)----------
 // 根布局含 overlay(id) + overlayCard(id)。showCard 渲染卡片并显示;点遮罩不关闭(防误触)。
 function showCard(contentView) {
@@ -506,10 +635,12 @@ function cardReport(summary) {
             <text id="more" visibility="gone" textSize="10sp" textColor="#8b857b" gravity="center" padding="0 6" />
             <text id="ok" text="✓ 完成" textSize="14sp" textStyle="bold" textColor="#fffdf8" padding="14 12" gravity="center" margin="14 12 4 4" />
         </vertical>);
-    card.title.setText("运行报告");
+    card.title.setText(s.incomplete ? "运行报告 · 未完成" : "运行报告");
     card.mode.setText(s.mode === '模拟' ? '模拟 · 不下单' : '真实下单');
     card.mode.setBackground(roundRect(s.mode === '模拟' ? "#8b857b" : "#a8443a", 8, null, 0));
-    card.ts.setText(s.ts ? fmtTs(s.ts) : "");
+    var reportState = runStatusMeta(s);
+    card.ts.setText((s.ts ? fmtTs(s.ts) : "") + (s.status ? " · " + reportState.label : ""));
+    card.ts.setTextColor(COL(s.incomplete ? reportState.color : "#8b857b"));
     // 汇总四格:成交 · 失败 · 跳过 · 买入合计
     var det = s.detail || [];
     var buyTotal = 0;
@@ -570,6 +701,7 @@ function cardReport(summary) {
     }
     var ST = { ok: { icon: '✅', lab: '成交', col: '#2e8b57' }, skipped: { icon: '⏭', lab: '跳过', col: '#8b857b' },
         dry_run_stopped_at_pwd: { icon: '⏸', lab: '模拟停', col: '#b0704a' }, rejected: { icon: '✕', lab: '拒绝', col: '#8b857b' },
+        unknown_interrupted: { icon: '?', lab: '待核对', col: '#a8443a' },
         error: { icon: '❌', lab: '失败', col: '#c0392b' } };
     // 明细超 10 条截断(无 scroll,避免卡片过高溢出屏幕)
     var MAX_ROWS = 10;
@@ -613,6 +745,127 @@ function cardReport(summary) {
     card.ok.setBackground(roundRect("#3d342a", 10, null, 0));
     card.ok.on("click", function () { hideCard(); });
     showCard(card);
+}
+
+// 运行历史页：按批次展示；点一条进入完整汇总和买卖明细。
+function renderRunHistory() {
+    var body = ui.cfgBody;
+    body.removeAllViews(); resetNav();
+    var top = ui.inflate(
+        <horizontal gravity="center_vertical" margin="0 2 0 10">
+            <button id="back" text="← 返回" textColor="#3d342a" textSize="13sp" padding="14 9" />
+            <vertical layout_weight="1" padding="6 0 0 0">
+                <text text="运行历史" textColor="#3d342a" textSize="16sp" textStyle="bold" />
+                <text id="sub" textColor="#8b857b" textSize="11sp" />
+            </vertical>
+        </horizontal>);
+    top.back.setBackground(roundRect("#fffdf8", 12, "#e7e1d4", 1));
+    var rows = loadRunHistory();
+    top.sub.setText("共 " + rows.length + " 次 · 最多保留 " + RUN_HISTORY_LIMIT + " 次");
+    var backHome = function () { showHome(); };
+    top.back.on("click", backHome); pushNavLayer(backHome, 1); body.addView(top);
+    if (!rows.length) {
+        body.addView(ui.inflate(<text text="暂无运行记录" textColor="#8b857b" textSize="14sp" gravity="center" padding="0 80" />));
+        showConfig(); return;
+    }
+    rows.forEach(function (r) {
+        var sm = runStatusMeta(r), total = (r.plan || []).length || ((r.buy || 0) + (r.sell || 0));
+        var done = r.nextIndex || (r.detail || []).length;
+        var card = ui.inflate(
+            <vertical padding="14 13" margin="0 0 0 8">
+                <horizontal gravity="center_vertical">
+                    <text id="time" textSize="13sp" textStyle="bold" textColor="#3d342a" layout_weight="1" />
+                    <text id="state" textSize="10sp" textStyle="bold" textColor="#fffdf8" padding="7 3" />
+                </horizontal>
+                <text id="meta" textSize="11sp" textColor="#8b857b" margin="0 5 0 0" />
+                <text id="stats" textSize="11sp" textColor="#6a645a" margin="0 5 0 0" />
+            </vertical>);
+        card.setBackground(roundRect("#fffdf8", 12, "#e7e1d4", 1));
+        card.time.setText(fmtDateTime(r.ts));
+        card.state.setText(sm.label); card.state.setBackground(roundRect(sm.color, 7, null, 0));
+        var keys = (r.strategyKeys || []).map(function (k) { return STRAT_CN[k] || k; }).join('·') || '未记录';
+        card.meta.setText(r.mode + " · " + keys + (total ? " · 进度 " + done + "/" + total : ""));
+        card.stats.setText("成交 " + (r.ok || 0) + "   失败 " + (r.fail || 0) + "   跳过 " + (r.skip || 0) + "   买/卖 " + (r.buy || 0) + "/" + (r.sell || 0));
+        var runId = r.id;
+        card.on("click", function () { renderRunDetail(runId); });
+        body.addView(card);
+    });
+    showConfig();
+}
+
+function renderRunDetail(runId) {
+    var r = findRunById(runId);
+    if (!r) { toast("运行记录不存在"); renderRunHistory(); return; }
+    var body = ui.cfgBody; body.removeAllViews();
+    var top = ui.inflate(
+        <horizontal gravity="center_vertical" margin="0 2 0 10">
+            <button id="back" text="← 历史" textColor="#3d342a" textSize="13sp" padding="14 9" />
+            <vertical layout_weight="1" padding="6 0 0 0">
+                <text text="运行详情" textColor="#3d342a" textSize="16sp" textStyle="bold" />
+                <text id="sub" textColor="#8b857b" textSize="11sp" />
+            </vertical>
+        </horizontal>);
+    top.back.setBackground(roundRect("#fffdf8", 12, "#e7e1d4", 1));
+    top.sub.setText(fmtDateTime(r.ts));
+    top.back.on("click", function () { renderRunHistory(); }); body.addView(top);
+
+    var sm = runStatusMeta(r);
+    var head = ui.inflate(
+        <vertical padding="14 13" margin="0 0 0 10">
+            <horizontal gravity="center_vertical">
+                <text id="state" textSize="12sp" textStyle="bold" textColor="#fffdf8" padding="8 4" />
+                <text id="mode" textSize="11sp" textColor="#8b857b" margin="10 0 0 0" layout_weight="1" />
+            </horizontal>
+            <text id="strategy" textSize="11sp" textColor="#6a645a" margin="0 8 0 0" />
+            <horizontal id="stats" margin="0 11 0 0" />
+            <text id="progress" textSize="11sp" textColor="#8b857b" margin="0 8 0 0" />
+            <text id="err" visibility="gone" textSize="11sp" textColor="#c0392b" margin="0 6 0 0" />
+        </vertical>);
+    head.setBackground(roundRect("#fffdf8", 12, "#e7e1d4", 1));
+    head.state.setText(sm.label); head.state.setBackground(roundRect(sm.color, 7, null, 0));
+    head.mode.setText(r.mode === '模拟' ? '模拟 · 不下单' : '真实下单');
+    head.strategy.setText("策略  " + ((r.strategyKeys || []).map(function (k) { return STRAT_CN[k] || k; }).join(' · ') || '未记录'));
+    var statCell = function (num, label, color) {
+        var v = ui.inflate(<vertical gravity="center" padding="0 7" layout_weight="1" margin="3 0"><text id="n" textSize="18sp" textStyle="bold" /><text id="l" textSize="10sp" textColor="#8b857b" /></vertical>);
+        v.n.setText("" + num); v.n.setTextColor(COL(color)); v.l.setText(label); v.setBackground(roundRect("#f6f4ef", 9, "#eee8db", 1)); return v;
+    };
+    var buyTotal = 0;
+    (r.detail || []).forEach(function (d) { if (d.a === 'buy' && (d.s === 'ok' || d.s === 'dry_run_stopped_at_pwd') && d.amt) buyTotal += d.amt; });
+    head.stats.addView(statCell(r.ok || 0, "成交", "#2e8b57"));
+    head.stats.addView(statCell(r.fail || 0, "失败", "#c0392b"));
+    head.stats.addView(statCell(r.skip || 0, "跳过", "#8b857b"));
+    head.stats.addView(statCell(buyTotal ? money(buyTotal).replace("¥", "") : "0", "买入合计", "#5a7a52"));
+    var total = (r.plan || []).length || ((r.buy || 0) + (r.sell || 0));
+    head.progress.setText("计划 买 " + (r.buy || 0) + " / 卖 " + (r.sell || 0) + (total ? "   已处理 " + (r.nextIndex || 0) + "/" + total : ""));
+    if (r.err) { head.err.setText("异常：" + r.err); head.err.setVisibility(0); }
+    body.addView(head);
+    body.addView(buildConfigSection("买卖操作记录"));
+    var details = r.detail || [];
+    if (!details.length) body.addView(ui.inflate(<text text="尚无已执行的买卖操作" textColor="#8b857b" textSize="12sp" gravity="center" padding="0 24" />));
+    details.forEach(function (d, i) {
+        var isBuy = d.a === 'buy';
+        var stMap = { ok: ['成交', '#2e8b57'], dry_run_stopped_at_pwd: ['模拟停', '#b0704a'], skipped: ['跳过', '#8b857b'], rejected: ['拒绝', '#8b857b'], unknown_interrupted: ['待核对', '#a8443a'], error: ['失败', '#c0392b'] };
+        var st = stMap[d.s] || [d.s || '未知', '#c0392b'];
+        var row = ui.inflate(
+            <horizontal gravity="center_vertical" padding="12 11" margin="0 0 0 6">
+                <text id="tag" textSize="10sp" textStyle="bold" textColor="#fffdf8" padding="6 3" />
+                <vertical layout_weight="1" margin="9 0 0 0"><text id="name" textSize="13sp" textStyle="bold" textColor="#3d342a" /><text id="meta" textSize="10sp" textColor="#8b857b" margin="0 3 0 0" /></vertical>
+                <text id="state" textSize="11sp" textStyle="bold" />
+            </horizontal>);
+        row.setBackground(roundRect("#fffdf8", 10, "#e7e1d4", 1));
+        row.tag.setText(isBuy ? '买' : '卖'); row.tag.setBackground(roundRect(isBuy ? '#5a7a52' : '#b0704a', 5, null, 0));
+        row.name.setText((i + 1) + ". " + d.name);
+        var meta = isBuy ? (d.amt != null ? money(d.amt) : '') : ('卖 1/' + (d.ratio ? Math.round(1 / d.ratio) : '?'));
+        if (d.strat) meta += ' · ' + d.strat;
+        if (d.m && d.s !== 'ok') meta += ' · ' + d.m;
+        row.meta.setText(meta); row.state.setText(st[0]); row.state.setTextColor(COL(st[1])); body.addView(row);
+    });
+    if (r.incomplete && total > (r.nextIndex || 0)) {
+        body.addView(ui.inflate(<text id="pending" textColor="#b0704a" textSize="11sp" gravity="center" padding="0 14" />));
+        body.getChildAt(body.getChildCount() - 1).setText("尚有 " + (total - (r.nextIndex || 0)) + " 笔未执行，" +
+            (canResumeRun(r) ? "下次点击运行可继续" : "本次已放弃续跑"));
+    }
+    showConfig();
 }
 
 // rawInput 兼容 Promise(旧);现底层走纸感卡片浮层,业务回调结构不变。
@@ -716,7 +969,7 @@ function renderConfig() {
             <button id="back" text="← 返回" textColor="#3d342a" textSize="13sp" padding="14 9" />
             <vertical layout_weight="1" padding="6 0 0 0">
                 <text text="交易配置" textColor="#3d342a" textSize="16sp" textStyle="bold" />
-                <text text="长按基金卡片可触发交易(演示)" textColor="#8b857b" textSize="11sp" />
+                <text text="策略、风控与运行记录" textColor="#8b857b" textSize="11sp" />
             </vertical>
         </horizontal>);
     top.back.setBackground(roundRect("#fffdf8", 12, "#e7e1d4", 1));
@@ -850,12 +1103,14 @@ function renderConfig() {
         });
     body.addView(dryCard);
 
+    var historyCard = buildConfigRow("运行历史", "按每次运行查看状态、汇总与买卖明细",
+        loadRunHistory().length + " 次  ›", "#3d342a",
+        function () { renderRunHistory(); });
+    body.addView(historyCard);
+
     var execCard = buildConfigRow("立即执行策略", "扫描全部基金,启用的策略买卖一遍",
         "▶ " + (c.dryRun ? "模拟" : "真实"), c.dryRun ? "#8a6a2f" : "#a8443a",
-        function () {
-            if (!secretStore.has() && !c.dryRun) { toast("未设置支付密码,无法真实下单"); return; }
-            runStrategy();
-        });
+        function () { openRunPicker(); });
     body.addView(execCard);
 
     var buyCard = buildConfigRow("测试买入", "10 元 · 按上方模拟开关",
@@ -2040,8 +2295,25 @@ function stratLabel(s) {
 
 // 顶部「▶ 运行」入口:①勾选本次策略(默认全启用,停用置灰)→ ②防误触二次确认 → ③执行。
 // 防误触:确定按钮需≥1项才点亮;第二步弹确认卡,列明本次将跑的策略 + 模拟/真实,确认后才 runStrategy。
-function openRunPicker() {
+function openRunPicker(skipResumePrompt) {
+    if (activeRunControl) { toast("已有一次运行正在进行"); return; }
     if (!floaty.checkPermission()) { floaty.requestPermission(); toast("请先授予「悬浮窗」权限"); return; }
+    var previous = !skipResumePrompt ? getResumableRun() : null;
+    if (previous) {
+        var psm = runStatusMeta(previous);
+        var left = Math.max(0, ((previous.plan || []).length || 0) - (previous.nextIndex || 0));
+        cardSelect("发现未完成的运行（" + psm.label + (left ? "，剩 " + left + " 笔" : "") + "）",
+            ["▶ 继续上次运行", "开始新运行（保留上次未完成记录）", "✕ 取消"], function (idx) {
+                if (idx === 0) {
+                    if (previous.mode === '真实' && !secretStore.has()) { toast("支付密码已缺失，无法继续真实运行"); return; }
+                    runStrategy(previous.strategyKeys, previous);
+                } else if (idx === 1) {
+                    abandonRun(previous);
+                    openRunPicker(true);
+                }
+            });
+        return;
+    }
     var c = loadTradeConfig();
     var S = c.strategies;
     var dcaGrpN = (c.groups || []).filter(function (g) { return g.dcaEnabled; }).length;
@@ -2069,83 +2341,127 @@ function openRunPicker() {
         // 第二步:防误触确认卡,明示本次范围 + 模式
         cardConfirm("确认运行", "策略:" + labels + "\n模式:" + mode + "\n\n确认执行?", function (ok) {
             if (!ok) return;
-            runStrategy(sel);
+            runStrategy(sel, null);
         });
     });
 }
 
-function runStrategy(onlyKeys) {
+function runStrategy(onlyKeys, resumeRun) {
+    if (activeRunControl) { toast("已有一次运行正在进行"); return; }
+    var currentCfg = loadTradeConfig();
+    var cfg = resumeRun && resumeRun.config ? resumeRun.config : currentCfg;
+    var keys = resumeRun && resumeRun.strategyKeys ? resumeRun.strategyKeys : (onlyKeys || []);
+    if (!keys.length) {
+        keys = Object.keys(cfg.strategies || {}).filter(function (k) { return cfg.strategies[k] && cfg.strategies[k].enabled; });
+    }
+    if ((resumeRun ? resumeRun.mode === '真实' : !cfg.dryRun) && !secretStore.has()) {
+        toast("未设置支付密码，无法真实下单"); return;
+    }
+    var summary = resumeRun || createRunRecord({
+        ts: new Date().getTime(), mode: cfg.dryRun ? '模拟' : '真实', strategyKeys: keys, config: cfg
+    });
+    // 续跑保留原计划和已执行明细，只重置本次线程态。
+    summary.status = 'running'; summary.incomplete = true; summary.resumable = true;
+    summary.endedAt = null; summary.err = null; summary.strategyKeys = keys; summary.config = cfg;
+    saveRunRecord(summary);
+    var control = { runId: summary.id, requested: null };
+    activeRunControl = control;
     threads.start(function () {
         var myPkg = currentPackage();
-        var cfg = loadTradeConfig();
-        var summary = { ts: new Date().getTime(), mode: cfg.dryRun ? '模拟' : '真实', buy: 0, sell: 0, ok: 0, fail: 0, skip: 0, detail: [] };
-        var freshData = null;  // 结束后追加采集的最新数据(供切回后刷新主页)
-        openFloaty("策略引擎");
+        var freshData = null;
+        openFloaty("策略引擎", true);
         try {
-            // 1. 采集
-            status("采集中…");
-            var data = collectFunds();
-            // 基金快照(供报告关联收益率/持仓金额)
-            summary.fundMap = {};
-            (data.funds || []).forEach(function (f) { summary.fundMap[f.name] = f; });
-            summary.hdr = data.hdr || {};
-            // 2. 生成计划(只对启用的模板;onlyKeys 进一步收窄本次执行范围)
-            var buys = planBuys(data.funds, cfg.strategies, cfg.groups, onlyKeys);
-            var sells = planSells(data.funds, cfg.strategies, onlyKeys);
-            summary.buy = buys.length; summary.sell = sells.length;
-            status("计划:买 " + buys.length + " 笔 / 卖 " + sells.length + " 笔");
-            var total = buys.length + sells.length, idx = 0;
-            // 3. 先卖后买
-            sells.forEach(function (o) {
-                idx++;
-                status("[" + idx + "/" + total + "] 卖 " + o.name + " (止盈)");
-                var r = sell({ name: o.name, ratio: o.ratio, dryRun: cfg.dryRun });
-                summary.detail.push({ a: 'sell', name: o.name, s: r.status, m: r.msg, strat: '止盈', ratio: o.ratio });
-                status(r.ok ? "✅ " + r.status : "❌ " + (r.msg || r.status), r.ok ? "#2e8b57" : "#c0392b");
-                if (r.status === 'skipped') summary.skip++; else if (r.ok) summary.ok++; else summary.fail++;
-            });
-            buys.forEach(function (o) {
-                idx++;
-                status("[" + idx + "/" + total + "] 买 " + o.name + " " + o.amount + "元 (" + stratLabel(o.strategy) + ")");
-                var r = buy({ name: o.name, amount: o.amount, dryRun: cfg.dryRun });
-                summary.detail.push({ a: 'buy', name: o.name, s: r.status, m: r.msg, amt: o.amount, strat: stratLabel(o.strategy) });
-                status(r.ok ? "✅ " + r.status : "❌ " + (r.msg || r.status), r.ok ? "#2e8b57" : "#c0392b");
-                if (r.ok) summary.ok++; else summary.fail++;
-            });
-            // 4. 写批次审计
-            appendAudit(JSON.stringify({ ts: new Date().getTime(), action: 'strategy_batch', buy: summary.buy, sell: summary.sell, ok: summary.ok, fail: summary.fail, skip: summary.skip, dryRun: !!cfg.dryRun }));
-            status("完成:成交 " + summary.ok + " / 失败 " + summary.fail + " / 跳过 " + summary.skip, "#2e8b57");
-            // 5. 结束后再采集一次,刷新买卖后的最新持仓(模拟/真实都采;失败不阻断报告)
-            try {
-                status("刷新最新数据…");
-                freshData = collectFunds();
-                saveData(freshData);
-            } catch (ce) {
-                console.log("STRAT 结束采集失败 " + ce);
-                status("⚠️ 结束采集失败,展示报告", "#c0392b");
+            // 新运行先采集并固化计划；续跑直接使用原计划，避免重复执行已完成买卖。
+            if (!summary.plan || !summary.plan.length) {
+                summary.phase = 'collecting'; saveRunRecord(summary);
+                status("采集中…");
+                var data = collectFunds();
+                summary.fundMap = {};
+                (data.funds || []).forEach(function (f) { summary.fundMap[f.name] = f; });
+                summary.hdr = data.hdr || {};
+                var buys = planBuys(data.funds, cfg.strategies, cfg.groups, keys);
+                var sells = planSells(data.funds, cfg.strategies, keys);
+                summary.buy = buys.length; summary.sell = sells.length;
+                summary.plan = sells.map(function (o) {
+                    return { a: 'sell', name: o.name, ratio: o.ratio, strat: '止盈', state: 'pending' };
+                }).concat(buys.map(function (o) {
+                    return { a: 'buy', name: o.name, amt: o.amount, strat: stratLabel(o.strategy), state: 'pending' };
+                }));
+                summary.nextIndex = 0; summary.currentIndex = null; summary.phase = 'executing';
+                saveRunRecord(summary);
+            }
+            var total = summary.plan.length;
+            status("计划:买 " + summary.buy + " 笔 / 卖 " + summary.sell + " 笔" + (summary.nextIndex ? "，续跑第 " + (summary.nextIndex + 1) + " 笔" : ""));
+            for (var i = summary.nextIndex || 0; i < total; i++) {
+                if (control.requested) break;
+                var o = summary.plan[i];
+                if (o.state === 'done' || o.state === 'unknown') { summary.nextIndex = i + 1; continue; }
+                // 先落盘 executing。若进程此时消失，重启会把该笔标为“待核对”并跳过，防止重复下单。
+                summary.currentIndex = i; o.state = 'executing'; saveRunRecord(summary);
+                status("[" + (i + 1) + "/" + total + "] " + (o.a === 'sell' ? '卖 ' : '买 ') + o.name +
+                    (o.a === 'buy' ? " " + o.amt + "元 (" + o.strat + ")" : " (止盈)"));
+                var result;
+                try {
+                    result = o.a === 'sell'
+                        ? sell({ name: o.name, ratio: o.ratio, dryRun: summary.mode === '模拟' })
+                        : buy({ name: o.name, amount: o.amt, dryRun: summary.mode === '模拟' });
+                } catch (opErr) {
+                    result = { ok: false, status: 'error', msg: String(opErr) };
+                }
+                summary.detail.push({ a: o.a, name: o.name, s: result.status, m: result.msg, amt: o.amt, strat: o.strat, ratio: o.ratio });
+                o.state = 'done'; o.resultStatus = result.status;
+                summary.nextIndex = i + 1; summary.currentIndex = null;
+                recalcRunStats(summary); saveRunRecord(summary);
+                status(result.ok ? "✅ " + result.status : "❌ " + (result.msg || result.status), result.ok ? "#2e8b57" : "#c0392b");
+            }
+            if (control.requested && summary.nextIndex < total) {
+                summary.status = control.requested; summary.incomplete = true; summary.resumable = true;
+                summary.endedAt = new Date().getTime();
+                saveRunRecord(summary);
+                hideRunControls();
+                status(control.requested === 'paused' ? "⏸ 已暂停，下次运行时可继续" : "■ 已终止，本次未完成", "#b0704a");
+            } else {
+                summary.status = 'completed'; summary.incomplete = false; summary.resumable = false;
+                summary.phase = 'completed'; summary.endedAt = new Date().getTime();
+                saveRunRecord(summary);
+                hideRunControls();
+                status("完成:成交 " + summary.ok + " / 失败 " + summary.fail + " / 跳过 " + summary.skip, "#2e8b57");
+                // 完成后再采集一次，刷新买卖后的最新持仓；暂停/终止不再做额外自动化。
+                try {
+                    status("刷新最新数据…");
+                    freshData = collectFunds(); saveData(freshData);
+                } catch (ce) {
+                    console.log("STRAT 结束采集失败 " + ce);
+                    status("⚠️ 结束采集失败,展示报告", "#c0392b");
+                }
             }
         } catch (e) {
             console.log("STRAT 异常 " + e);
-            summary.err = String(e);
+            summary.err = String(e); summary.status = 'failed'; summary.incomplete = true;
+            summary.resumable = true; summary.endedAt = new Date().getTime();
+            saveRunRecord(summary);
+            hideRunControls();
             status("❌ 策略异常: " + e, "#c0392b");
             ui.post(function () { toast("❌ 策略引擎异常: " + e); });
         }
-        ui.post(function () { toast("策略完成: 成交 " + summary.ok + " / 失败 " + summary.fail + " / 跳过 " + summary.skip); });
-        sleep(1500);
-        closeFloaty();
-        // 切回本 App:模拟运行后停在支付宝密码页,单次 launchPackage 易被 MIUI 拦截 → 多重重试 + 验证
+        recalcRunStats(summary); saveRunRecord(summary);
+        appendAudit(JSON.stringify({ ts: new Date().getTime(), runId: summary.id, action: 'strategy_batch',
+            status: summary.status, incomplete: !!summary.incomplete, buy: summary.buy, sell: summary.sell,
+            ok: summary.ok, fail: summary.fail, skip: summary.skip, dryRun: summary.mode === '模拟' }));
+        ui.post(function () { toast(runStatusMeta(summary).label + ": 成交 " + summary.ok + " / 失败 " + summary.fail + " / 跳过 " + summary.skip); });
+        sleep(1500); closeFloaty(); activeRunControl = null;
+        // 切回本 App（模拟运行后通常停在支付宝密码页）。
         var back = false;
         for (var k = 0; k < 8; k++) {
-            try { app.launchPackage(myPkg); } catch (e) {}
+            try { app.launchPackage(myPkg); } catch (launchErr) {}
             sleep(700);
             if (currentPackage() === myPkg) { back = true; break; }
         }
         if (!back) {
-            ui.post(function () { toast("策略完成,请手动切回本 App 查看报告"); });
+            ui.post(function () { toast("运行已记录，请手动切回本 App 查看"); });
             return;
         }
-        sleep(400);  // 等界面稳定到前台后再 inflate(后台 inflate 易致 view 绑定失败)
-        // 切回成功(前台):先用结束采集的最新数据刷新主页,再弹运行报告卡片
+        sleep(400);
         ui.post(function () {
             if (freshData) {
                 try { render(freshData); ui.meta.setText(fmtTs(freshData.ts)); }
@@ -2165,9 +2481,10 @@ ui.layout(
                     <text text="支付宝 · 基金持仓" textColor="#3d342a" textSize="15sp" textStyle="bold" />
                     <text id="meta" text="点右上角刷新按钮获取数据" textColor="#8b857b" textSize="11sp" />
                 </vertical>
-                <button id="cfg" w="36" h="36" text="⚙" textColor="#3d342a" textSize="20sp" gravity="center" margin="0 0 0 8" padding="0" />
-                <button id="runBtn" w="36" h="36" text="▶" textColor="#3d342a" textSize="16sp" gravity="center" margin="0 0 0 6" padding="0" />
-                <button id="btn" w="36" h="36" text="↻" textColor="#3d342a" textSize="26sp" gravity="center|top" margin="0 0 0 6" padding="0" />
+                <img id="histBtn" w="36" h="36" margin="0 0 0 6" padding="9" />
+                <img id="cfg" w="36" h="36" margin="0 0 0 6" padding="9" />
+                <img id="runBtn" w="36" h="36" margin="0 0 0 6" padding="9" />
+                <img id="btn" w="36" h="36" margin="0 0 0 6" padding="9" />
             </horizontal>
             <scroll layout_weight="1">
                 <vertical>
@@ -2184,10 +2501,184 @@ ui.layout(
     </frame>
 );
 
-// 刷新按钮:纯图标(透明背景,完全融入 header)
-ui.btn.setBackground(new GD());
-ui.cfg.setBackground(new GD());
-ui.runBtn.setBackground(new GD());
+// 顶部图标使用同一规格的透明 PNG，不再依赖 Unicode 字体基线。
+// F5 单文件运行不会同步 res 目录，因此把小尺寸 PNG 直接内嵌。
+var TOOLBAR_ICON_B64 = {
+    history: "iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXAvmHAAAABGdBTUEAALGPC/xhBQAAACBjSFJNAAB6JgAAgIQAAPoAAACA6AAA" +
+        "dTAAAOpgAAA6mAAAF3CculE8AAAARGVYSWZNTQAqAAAACAABh2kABAAAAAEAAAAaAAAAAAADoAEAAwAAAAEAAQAAoAIABAAAAAEA" +
+        "AAAwoAMABAAAAAEAAAAwAAAAANs3bAwAAAHLaVRYdFhNTDpjb20uYWRvYmUueG1wAAAAAAA8eDp4bXBtZXRhIHhtbG5zOng9ImFk" +
+        "b2JlOm5zOm1ldGEvIiB4OnhtcHRrPSJYTVAgQ29yZSA2LjAuMCI+CiAgIDxyZGY6UkRGIHhtbG5zOnJkZj0iaHR0cDovL3d3dy53" +
+        "My5vcmcvMTk5OS8wMi8yMi1yZGYtc3ludGF4LW5zIyI+CiAgICAgIDxyZGY6RGVzY3JpcHRpb24gcmRmOmFib3V0PSIiCiAgICAg" +
+        "ICAgICAgIHhtbG5zOmV4aWY9Imh0dHA6Ly9ucy5hZG9iZS5jb20vZXhpZi8xLjAvIj4KICAgICAgICAgPGV4aWY6Q29sb3JTcGFj" +
+        "ZT4xPC9leGlmOkNvbG9yU3BhY2U+CiAgICAgICAgIDxleGlmOlBpeGVsWERpbWVuc2lvbj4xNDQ8L2V4aWY6UGl4ZWxYRGltZW5z" +
+        "aW9uPgogICAgICAgICA8ZXhpZjpQaXhlbFlEaW1lbnNpb24+MTQ0PC9leGlmOlBpeGVsWURpbWVuc2lvbj4KICAgICAgPC9yZGY6" +
+        "RGVzY3JpcHRpb24+CiAgIDwvcmRmOlJERj4KPC94OnhtcG1ldGE+CpkxjV8AAAjESURBVGgF7Vh7bJtXFb/nfrYTZ00CaZOCFtok" +
+        "dR0nDmmYByhLWJxmazfBitaqQzy1MWkwOoEEAtZBpRZWHqVjmwTjMTRAGlSik8Y2oLRTFoetlHZqCamcd9pkrFPbLF3TLLFjf/de" +
+        "ftfJh1zn8yNpxj/kOs7n79xzz/uce+5lbHksW2DZAssWyGSB7X6/S38VY5QJb7FzS0r0wx5PUX6eCjBFjYxUHYiXG8QLBQBKiggj" +
+        "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",
+    settings: "iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXAvmHAAAABGdBTUEAALGPC/xhBQAAACBjSFJNAAB6JgAAgIQAAPoAAACA6AAA" +
+        "dTAAAOpgAAA6mAAAF3CculE8AAAARGVYSWZNTQAqAAAACAABh2kABAAAAAEAAAAaAAAAAAADoAEAAwAAAAEAAQAAoAIABAAAAAEA" +
+        "AAAwoAMABAAAAAEAAAAwAAAAANs3bAwAAAHLaVRYdFhNTDpjb20uYWRvYmUueG1wAAAAAAA8eDp4bXBtZXRhIHhtbG5zOng9ImFk" +
+        "b2JlOm5zOm1ldGEvIiB4OnhtcHRrPSJYTVAgQ29yZSA2LjAuMCI+CiAgIDxyZGY6UkRGIHhtbG5zOnJkZj0iaHR0cDovL3d3dy53" +
+        "My5vcmcvMTk5OS8wMi8yMi1yZGYtc3ludGF4LW5zIyI+CiAgICAgIDxyZGY6RGVzY3JpcHRpb24gcmRmOmFib3V0PSIiCiAgICAg" +
+        "ICAgICAgIHhtbG5zOmV4aWY9Imh0dHA6Ly9ucy5hZG9iZS5jb20vZXhpZi8xLjAvIj4KICAgICAgICAgPGV4aWY6Q29sb3JTcGFj" +
+        "ZT4xPC9leGlmOkNvbG9yU3BhY2U+CiAgICAgICAgIDxleGlmOlBpeGVsWERpbWVuc2lvbj4xNDQ8L2V4aWY6UGl4ZWxYRGltZW5z" +
+        "aW9uPgogICAgICAgICA8ZXhpZjpQaXhlbFlEaW1lbnNpb24+MTQ0PC9leGlmOlBpeGVsWURpbWVuc2lvbj4KICAgICAgPC9yZGY6" +
+        "RGVzY3JpcHRpb24+CiAgIDwvcmRmOlJERj4KPC94OnhtcG1ldGE+CpkxjV8AAAsKSURBVGgF7Vl7cFTVGT+Pe3c3EBNISMCkkMdu" +
+        "kg0bIhoFgZAEgo9iZXxAWzudqdPHTG071mqnjh1rrdapfzjj1Me0OsO002IdJ6OijkqQPHgULC0GhSQk7OYBiRhDSICY7O6955z+" +
+        "DrD0suySpY1/dIY7kz3v73znO9/3O79zQsiV74oFrljg/9oC9MvQvi4QmGcYlk9IybV8zpiYUKJ79yehz6d7vmlfwAp/yV0GV88x" +
+        "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",
+    run: "iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXAvmHAAAABGdBTUEAALGPC/xhBQAAACBjSFJNAAB6JgAAgIQAAPoAAACA6AAA" +
+        "dTAAAOpgAAA6mAAAF3CculE8AAAARGVYSWZNTQAqAAAACAABh2kABAAAAAEAAAAaAAAAAAADoAEAAwAAAAEAAQAAoAIABAAAAAEA" +
+        "AAAwoAMABAAAAAEAAAAwAAAAANs3bAwAAAHLaVRYdFhNTDpjb20uYWRvYmUueG1wAAAAAAA8eDp4bXBtZXRhIHhtbG5zOng9ImFk" +
+        "b2JlOm5zOm1ldGEvIiB4OnhtcHRrPSJYTVAgQ29yZSA2LjAuMCI+CiAgIDxyZGY6UkRGIHhtbG5zOnJkZj0iaHR0cDovL3d3dy53" +
+        "My5vcmcvMTk5OS8wMi8yMi1yZGYtc3ludGF4LW5zIyI+CiAgICAgIDxyZGY6RGVzY3JpcHRpb24gcmRmOmFib3V0PSIiCiAgICAg" +
+        "ICAgICAgIHhtbG5zOmV4aWY9Imh0dHA6Ly9ucy5hZG9iZS5jb20vZXhpZi8xLjAvIj4KICAgICAgICAgPGV4aWY6Q29sb3JTcGFj" +
+        "ZT4xPC9leGlmOkNvbG9yU3BhY2U+CiAgICAgICAgIDxleGlmOlBpeGVsWERpbWVuc2lvbj4xNDQ8L2V4aWY6UGl4ZWxYRGltZW5z" +
+        "aW9uPgogICAgICAgICA8ZXhpZjpQaXhlbFlEaW1lbnNpb24+MTQ0PC9leGlmOlBpeGVsWURpbWVuc2lvbj4KICAgICAgPC9yZGY6" +
+        "RGVzY3JpcHRpb24+CiAgIDwvcmRmOlJERj4KPC94OnhtcG1ldGE+CpkxjV8AAAaTSURBVGgF7VhrbFRFFJ65dx9VkFeTJig/arvQ" +
+        "x1IEYoI8u6WVQhD/GDUqP0xM0AgCidoERARtohETI0EwPv5JTMR/QHgo3W1pJMZUA3a73Xa3XQgmNiBEoNDu3pnxO7cl6YPdOwu7" +
+        "EpMO9O69d849831nzjlzZhibaBMWmLDA/9oCXBf9En/py27GX+BSXVHc3N/c0XVa99t8ymkRCMwte0VJ62vOlP2Pcz7AmbF/csHU" +
+        "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" +
+        "hAUyWuBfP52jmsr0fMgAAAAASUVORK5CYII=",
+    refresh: "iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXAvmHAAAABGdBTUEAALGPC/xhBQAAACBjSFJNAAB6JgAAgIQAAPoAAACA6AAA" +
+        "dTAAAOpgAAA6mAAAF3CculE8AAAARGVYSWZNTQAqAAAACAABh2kABAAAAAEAAAAaAAAAAAADoAEAAwAAAAEAAQAAoAIABAAAAAEA" +
+        "AAAwoAMABAAAAAEAAAAwAAAAANs3bAwAAAHLaVRYdFhNTDpjb20uYWRvYmUueG1wAAAAAAA8eDp4bXBtZXRhIHhtbG5zOng9ImFk" +
+        "b2JlOm5zOm1ldGEvIiB4OnhtcHRrPSJYTVAgQ29yZSA2LjAuMCI+CiAgIDxyZGY6UkRGIHhtbG5zOnJkZj0iaHR0cDovL3d3dy53" +
+        "My5vcmcvMTk5OS8wMi8yMi1yZGYtc3ludGF4LW5zIyI+CiAgICAgIDxyZGY6RGVzY3JpcHRpb24gcmRmOmFib3V0PSIiCiAgICAg" +
+        "ICAgICAgIHhtbG5zOmV4aWY9Imh0dHA6Ly9ucy5hZG9iZS5jb20vZXhpZi8xLjAvIj4KICAgICAgICAgPGV4aWY6Q29sb3JTcGFj" +
+        "ZT4xPC9leGlmOkNvbG9yU3BhY2U+CiAgICAgICAgIDxleGlmOlBpeGVsWERpbWVuc2lvbj4xNDQ8L2V4aWY6UGl4ZWxYRGltZW5z" +
+        "aW9uPgogICAgICAgICA8ZXhpZjpQaXhlbFlEaW1lbnNpb24+MTQ0PC9leGlmOlBpeGVsWURpbWVuc2lvbj4KICAgICAgPC9yZGY6" +
+        "RGVzY3JpcHRpb24+CiAgIDwvcmRmOlJERj4KPC94OnhtcG1ldGE+CpkxjV8AAAfvSURBVGgF7VlrbFRFFJ6Ze7eFFmgFmvIopLbb" +
+        "dutSCiFqiFAaRKJGYxQFtUYN/DEhxh8+/pgQUPSXEeKDgDH6wxCiiEqM8cFrMUqIChJoQ1v6AsrDAFKpbWn3zhy/c29agd7bLtst" +
+        "hKTTZufuuTPnnO/MmXNmzgox0kYsMGKBW9oCMlXaz5kzJ5TZfSlsGVVmRDwqSE0hEhlC4YmoXdl0XBhVk6btIz/U1rakSu6QAdxb" +
+        "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"
+};
+function loadToolbarIcon(view, iconKey, description) {
+    try {
+        var bytes = Base64.decode(TOOLBAR_ICON_B64[iconKey], 0);
+        var bitmap = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.length);
+        if (!bitmap) throw new Error("图片解码失败: " + iconKey);
+        view.setImageBitmap(bitmap);
+        view.setScaleType(android.widget.ImageView.ScaleType.FIT_CENTER);
+        try { view.setColorFilter(COL("#3d342a"), android.graphics.PorterDuff.Mode.SRC_IN); } catch (tintErr) {}
+        view.setContentDescription(description);
+        view.setBackground(new GD());
+        // 保留 36dp 点击区域，四边 9dp 后图标绘制区域为 18dp（原来的一半）。
+        var density = context.getResources().getDisplayMetrics().density;
+        var pad = Math.round(9 * density);
+        view.setPadding(pad, pad, pad, pad);
+    } catch (e) { console.log("顶部图标加载失败 " + e); }
+}
+loadToolbarIcon(ui.histBtn, "history", "运行历史");
+loadToolbarIcon(ui.cfg, "settings", "交易配置");
+loadToolbarIcon(ui.runBtn, "run", "运行策略");
+loadToolbarIcon(ui.btn, "refresh", "刷新持仓");
 
 function applyQuerySort(funds, q, key, dir) {
     return funds.slice()
@@ -2334,14 +2825,18 @@ function render(d) {
     renderList(d);
 }
 
-function fmtTs(ts) { var d = new Date(ts); var p = function (n) { return ("0" + n).slice(-2); }; return "更新于 " + d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) + " " + p(d.getHours()) + ":" + p(d.getMinutes()); }
+function fmtDateTime(ts) { var d = new Date(ts); var p = function (n) { return ("0" + n).slice(-2); }; return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) + " " + p(d.getHours()) + ":" + p(d.getMinutes()); }
+function fmtTs(ts) { return "更新于 " + fmtDateTime(ts); }
 
 // 启动时显示已存数据
+// 上次进程若在策略运行中退出，将批次恢复为“意外中断 · 未完成”。
+recoverStaleRuns();
 var saved = loadData();
 if (saved) { render(saved); ui.meta.setText(fmtTs(saved.ts)); }
 
 // 采集按钮
 ui.btn.on("click", function () {
+    if (activeRunControl) { toast("策略运行中，请先暂停或终止后再采集"); return; }
     // 悬浮窗需「显示在其他应用上层」权限;首次使用引导授权
     if (!floaty.checkPermission()) { floaty.requestPermission(); toast("请授予「悬浮窗」权限后再次点击采集"); return; }
     ui.btn.setEnabled(false); ui.btn.setAlpha(0.4);
@@ -2370,6 +2865,8 @@ ui.btn.on("click", function () {
 
 // 设置按钮 = 交易配置
 ui.cfg.on("click", function () { openConfigUI(); });
+// 时钟按钮 = 运行历史
+ui.histBtn.on("click", function () { renderRunHistory(); });
 // 顶部运行按钮 → 策略选择 + 防误触确认
 ui.runBtn.on("click", function () { openRunPicker(); });
 // overlay 点击消费(防穿透到下层);在 ui.layout 后绑定,此时 ui.overlay 才存在
