@@ -2079,6 +2079,7 @@ function runStrategy(onlyKeys) {
         var myPkg = currentPackage();
         var cfg = loadTradeConfig();
         var summary = { ts: new Date().getTime(), mode: cfg.dryRun ? '模拟' : '真实', buy: 0, sell: 0, ok: 0, fail: 0, skip: 0, detail: [] };
+        var freshData = null;  // 结束后追加采集的最新数据(供切回后刷新主页)
         openFloaty("策略引擎");
         try {
             // 1. 采集
@@ -2114,6 +2115,15 @@ function runStrategy(onlyKeys) {
             // 4. 写批次审计
             appendAudit(JSON.stringify({ ts: new Date().getTime(), action: 'strategy_batch', buy: summary.buy, sell: summary.sell, ok: summary.ok, fail: summary.fail, skip: summary.skip, dryRun: !!cfg.dryRun }));
             status("完成:成交 " + summary.ok + " / 失败 " + summary.fail + " / 跳过 " + summary.skip, "#2e8b57");
+            // 5. 结束后再采集一次,刷新买卖后的最新持仓(模拟/真实都采;失败不阻断报告)
+            try {
+                status("刷新最新数据…");
+                freshData = collectFunds();
+                saveData(freshData);
+            } catch (ce) {
+                console.log("STRAT 结束采集失败 " + ce);
+                status("⚠️ 结束采集失败,展示报告", "#c0392b");
+            }
         } catch (e) {
             console.log("STRAT 异常 " + e);
             summary.err = String(e);
@@ -2135,8 +2145,12 @@ function runStrategy(onlyKeys) {
             return;
         }
         sleep(400);  // 等界面稳定到前台后再 inflate(后台 inflate 易致 view 绑定失败)
-        // 切回成功(前台)后弹出运行报告卡片
+        // 切回成功(前台):先用结束采集的最新数据刷新主页,再弹运行报告卡片
         ui.post(function () {
+            if (freshData) {
+                try { render(freshData); ui.meta.setText(fmtTs(freshData.ts)); }
+                catch (re) { console.log("刷新主页异常 " + re); }
+            }
             try { cardReport(summary); } catch (ex) { console.log("报告卡片异常 " + ex + "\n" + (ex && ex.stack ? ex.stack : "")); }
         });
     });
