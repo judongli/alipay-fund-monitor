@@ -65,8 +65,7 @@ function openFloaty(title, controllable) {
                 </horizontal>
                 <text id="op" text="准备中…" textColor="#3d342a" textSize="13sp" textStyle="bold" margin="0 4 0 0" />
                 <horizontal id="controls" visibility="gone" margin="0 9 0 0">
-                    <text id="pauseBtn" text="Ⅱ 暂停" textColor="#6a645a" textSize="11sp" textStyle="bold" gravity="center" padding="10 7" layout_weight="1" margin="0 0 4 0" />
-                    <text id="stopBtn" text="■ 终止" textColor="#a8443a" textSize="11sp" textStyle="bold" gravity="center" padding="10 7" layout_weight="1" margin="4 0 0 0" />
+                    <text id="pauseBtn" text="Ⅱ 暂停" textColor="#6a645a" textSize="11sp" textStyle="bold" gravity="center" padding="10 7" layout_weight="1" />
                 </horizontal>
             </vertical>
         </frame>
@@ -77,9 +76,7 @@ function openFloaty(title, controllable) {
         fw.op.setMaxLines(2);
         fw.controls.setVisibility(controllable ? 0 : 8);
         fw.pauseBtn.setBackground(roundRect("#f0ebe0", 8, "#e1d9ca", 1));
-        fw.stopBtn.setBackground(roundRect("#fbeceb", 8, "#e9c8c4", 1));
-        fw.pauseBtn.on("click", function () { requestRunStop('paused'); });
-        fw.stopBtn.on("click", function () { requestRunStop('terminated'); });
+        fw.pauseBtn.on("click", requestRunPause);
         var dm = context.getResources().getDisplayMetrics();
         fx = Math.floor((dm.widthPixels - 270 * dm.density) / 2); fy = 140; // 顶部居中(270dp = 卡片+边距)
         fw.setPosition(fx, fy);
@@ -91,15 +88,14 @@ function openFloaty(title, controllable) {
         fw.card.startAnimation(set);
     } catch (e) { console.log("悬浮窗样式失败: " + e); }
 }
-function requestRunStop(kind) {
+function requestRunPause() {
     if (!activeRunControl || activeRunControl.requested) return;
-    activeRunControl.requested = kind;
-    var lab = kind === 'paused' ? '暂停' : '终止';
-    status("已请求" + lab + "，当前操作完成后停止…", "#b0704a");
+    activeRunControl.requested = 'paused';
+    status("已请求暂停，当前操作完成后停止…", "#b0704a");
     try {
         if (fw) {
-            fw.pauseBtn.setEnabled(false); fw.stopBtn.setEnabled(false);
-            fw.pauseBtn.setAlpha(0.45); fw.stopBtn.setAlpha(0.45);
+            fw.pauseBtn.setEnabled(false);
+            fw.pauseBtn.setAlpha(0.45);
         }
     } catch (e) {}
 }
@@ -471,6 +467,26 @@ function showCard(contentView) {
     ui.overlay.setVisibility(0);  // VISIBLE
 }
 function hideCard() { ui.overlay.setVisibility(8); }  // GONE
+
+// 运行报告使用接近全屏的固定可用高度：中间内容滚动，底部操作按钮始终留在屏内。
+// 必须在 addView 后设置根视图 LayoutParams；AutoX 对未挂载根视图直接设 h/w 会空指针。
+function sizeReportCard(contentView) {
+    try {
+        var dm = context.getResources().getDisplayMetrics();
+        var density = dm.density;
+        var overlayHeight = ui.overlay.getHeight();
+        var height;
+        if (overlayHeight > 0) {
+            var insets = ui.overlay.getPaddingTop() + ui.overlay.getPaddingBottom() +
+                ui.overlayCard.getPaddingTop() + ui.overlayCard.getPaddingBottom();
+            height = Math.max(1, overlayHeight - insets);
+        } else {
+            // overlay 刚从 GONE 切为 VISIBLE 时可能尚未量出高度，首帧先用保守值。
+            height = Math.round(dm.heightPixels * 0.78);
+        }
+        contentView.setLayoutParams(new android.widget.LinearLayout.LayoutParams(-1, height));
+    } catch (e) { console.log("运行报告尺寸设置失败: " + e); }
+}
 // overlay 点击消费(防穿透)在 ui.layout 后绑定(见文件末尾按钮绑定区)
 
 // ---------- 硬件返回键统一分发 ----------
@@ -510,15 +526,12 @@ function installBackHandler() {
         });
     } catch (e) { console.log("ui.emitter back_pressed 绑定失败: " + e); }
     try {
-        var act = ui.getActivity();
+        // 部分 AutoX 版本没有 ui.getActivity()，直接调用只会产生无意义的启动报错。
+        var act = null;
+        if (ui && typeof ui.getActivity === "function") act = ui.getActivity();
+        else if (typeof activity !== "undefined") act = activity;
         if (act && typeof act.setBackPressed === "function") {
             act.setBackPressed(function () { handleBackPress(); });
-        } else if (act) {
-            // 反射兜底:覆写 onBackPressed;首页时由 handleBackPress 返回 false 再调 super 退出
-            act.onBackPressed = function () {
-                if (handleBackPress()) return;
-                try { act.finish(); } catch (e2) {}
-            };
         }
     } catch (e) { console.log("activity 返回键兜底失败: " + e); }
 }
@@ -617,6 +630,28 @@ function cardConfirm(title, msg, cb) {
     showCard(card);
 }
 
+// 汇总统计统一为 2×2 网格。四格挤在一行时，多位金额在小屏上会互相压缩。
+function addStatGrid(container, views) {
+    var LP = android.widget.LinearLayout.LayoutParams;
+    var MATCH_PARENT = -1, WRAP_CONTENT = -2;
+    var density = context.getResources().getDisplayMetrics().density;
+    var gap = Math.round(3 * density), rowGap = Math.round(6 * density);
+    for (var i = 0; i < views.length; i += 2) {
+        // AutoX 不能在 ui.inflate 的根节点上设置 w/layout_weight：根视图尚无 LayoutParams。
+        var row = ui.inflate(<horizontal />);
+        row.setPadding(0, 0, 0, rowGap);
+        var leftLp = new LP(0, WRAP_CONTENT, 1);
+        leftLp.setMargins(gap, 0, gap, 0);
+        row.addView(views[i], leftLp);
+        if (views[i + 1]) {
+            var rightLp = new LP(0, WRAP_CONTENT, 1);
+            rightLp.setMargins(gap, 0, gap, 0);
+            row.addView(views[i + 1], rightLp);
+        }
+        container.addView(row, new LP(MATCH_PARENT, WRAP_CONTENT));
+    }
+}
+
 // 运行报告卡片:运行结束切回 App 后弹出,汇总成交/失败/跳过 + 逐只基金明细。
 // summary: { ts, mode, buy, sell, ok, fail, skip, err?, fundMap, hdr, detail[] }
 //   detail[]: { a:'buy'|'sell', name, s:status, m:msg, amt?, strat?, ratio? }
@@ -629,11 +664,15 @@ function cardReport(summary) {
                 <text id="mode" textSize="10sp" textStyle="bold" textColor="#fffdf8" padding="7 3" />
             </horizontal>
             <text id="ts" textSize="11sp" textColor="#8b857b" margin="0 3 0 12" />
-            <horizontal id="stats" margin="0 0 0 12" />
-            <vertical id="dist" visibility="gone" margin="0 0 0 12" />
-            <vertical id="rows" margin="0 2 0 0" />
-            <text id="more" visibility="gone" textSize="10sp" textColor="#8b857b" gravity="center" padding="0 6" />
-            <text id="ok" text="✓ 完成" textSize="14sp" textStyle="bold" textColor="#fffdf8" padding="14 12" gravity="center" margin="14 12 4 4" />
+            <scroll layout_weight="1">
+                <vertical>
+                    <vertical id="stats" margin="0 0 0 8" />
+                    <vertical id="dist" visibility="gone" margin="0 0 0 12" />
+                    <vertical id="rows" margin="0 2 0 0" />
+                    <text id="more" visibility="gone" textSize="10sp" textColor="#8b857b" gravity="center" padding="0 6" />
+                </vertical>
+            </scroll>
+            <text id="ok" text="✓ 完成" textSize="14sp" textStyle="bold" textColor="#fffdf8" padding="14 12" gravity="center" margin="8 8 4 4" />
         </vertical>);
     card.title.setText(s.incomplete ? "运行报告 · 未完成" : "运行报告");
     card.mode.setText(s.mode === '模拟' ? '模拟 · 不下单' : '真实下单');
@@ -647,19 +686,21 @@ function cardReport(summary) {
     det.forEach(function (d) { if (d.a === 'buy' && d.s === 'ok' && d.amt) buyTotal += d.amt; });
     var cell = function (num, lab, col) {
         var v = ui.inflate(
-            <vertical gravity="center" padding="0 6" layout_weight="1" margin="3 0">
-                <text id="n" textSize="18sp" textStyle="bold" />
-                <text id="l" textSize="10sp" textColor="#8b857b" />
+            <vertical gravity="center" padding="0 8">
+                <text id="n" w="*" gravity="center" textSize="18sp" textStyle="bold" />
+                <text id="l" w="*" gravity="center" textSize="10sp" textColor="#8b857b" />
             </vertical>);
         v.n.setText("" + num); v.n.setTextColor(COL(col));
         v.l.setText(lab);
         v.setBackground(roundRect("#f6f4ef", 10, "#eee8db", 1));
         return v;
     };
-    card.stats.addView(cell(s.ok || 0, "成交", "#2e8b57"));
-    card.stats.addView(cell(s.fail || 0, "失败", "#c0392b"));
-    card.stats.addView(cell(s.skip || 0, "跳过", "#8b857b"));
-    card.stats.addView(cell(buyTotal ? money(buyTotal).replace("¥", "") : "0", "买入合计", "#5a7a52"));
+    addStatGrid(card.stats, [
+        cell(s.ok || 0, "成交", "#2e8b57"),
+        cell(s.fail || 0, "失败", "#c0392b"),
+        cell(s.skip || 0, "跳过", "#8b857b"),
+        cell(buyTotal ? money(buyTotal).replace("¥", "") : "0", "买入合计", "#5a7a52")
+    ]);
     // 策略命中分布行(填充预留的 dist 占位):统计 detail 里各策略出现次数
     var stratCount = {};
     det.forEach(function (d) {
@@ -703,8 +744,8 @@ function cardReport(summary) {
         dry_run_stopped_at_pwd: { icon: '⏸', lab: '模拟停', col: '#b0704a' }, rejected: { icon: '✕', lab: '拒绝', col: '#8b857b' },
         unknown_interrupted: { icon: '?', lab: '待核对', col: '#a8443a' },
         error: { icon: '❌', lab: '失败', col: '#c0392b' } };
-    // 明细超 10 条截断(无 scroll,避免卡片过高溢出屏幕)
-    var MAX_ROWS = 10;
+    // 汇总改为两行后，为无滚动报告卡预留高度；完整明细仍可在运行历史中查看。
+    var MAX_ROWS = 7;
     var shown = det.slice(0, MAX_ROWS);
     shown.forEach(function (d) {
         var isBuy = d.a === 'buy';
@@ -712,7 +753,7 @@ function cardReport(summary) {
         var f = (s.fundMap && s.fundMap[d.name]) || {};
         var row = ui.inflate(
             <horizontal gravity="center_vertical" padding="10 9" margin="0 0 0 5">
-                <text id="tag" textSize="10sp" textStyle="bold" textColor="#fffdf8" padding="5 3" />
+                <text id="sideTag" textSize="10sp" textStyle="bold" textColor="#fffdf8" padding="5 3" />
                 <vertical layout_weight="1" margin="8 0 0 0">
                     <horizontal gravity="center_vertical">
                         <text id="nm" textSize="13sp" textColor="#3d342a" layout_weight="1" />
@@ -722,8 +763,8 @@ function cardReport(summary) {
                 </vertical>
                 <text id="st" textSize="11sp" textStyle="bold" margin="0 0 0 8" />
             </horizontal>);
-        row.tag.setText(isBuy ? '买' : '卖');
-        row.tag.setBackground(roundRect(isBuy ? '#5a7a52' : '#b0704a', 5, null, 0));
+        row.sideTag.setText(isBuy ? '买' : '卖');
+        row.sideTag.setBackground(roundRect(isBuy ? '#5a7a52' : '#b0704a', 5, null, 0));
         row.nm.setText(d.name);
         // 收益率(带涨跌色)+ 持仓金额,关联采集快照
         if (f.rate != null) { row.rt.setText(pct(f.rate)); row.rt.setTextColor(COL(hexOf(f.rate))); }
@@ -745,6 +786,12 @@ function cardReport(summary) {
     card.ok.setBackground(roundRect("#3d342a", 10, null, 0));
     card.ok.on("click", function () { hideCard(); });
     showCard(card);
+    sizeReportCard(card);
+    ui.post(function () {
+        try {
+            if (ui.overlay.getVisibility() === 0 && card.getParent()) sizeReportCard(card);
+        } catch (e) { console.log("运行报告尺寸校准失败: " + e); }
+    }, 60);
 }
 
 // 运行历史页：按批次展示；点一条进入完整汇总和买卖明细。
@@ -775,19 +822,19 @@ function renderRunHistory() {
             <vertical padding="14 13" margin="0 0 0 8">
                 <horizontal gravity="center_vertical">
                     <text id="time" textSize="13sp" textStyle="bold" textColor="#3d342a" layout_weight="1" />
-                    <text id="state" textSize="10sp" textStyle="bold" textColor="#fffdf8" padding="7 3" />
+                    <text id="runState" textSize="10sp" textStyle="bold" textColor="#fffdf8" padding="7 3" />
                 </horizontal>
                 <text id="meta" textSize="11sp" textColor="#8b857b" margin="0 5 0 0" />
                 <text id="stats" textSize="11sp" textColor="#6a645a" margin="0 5 0 0" />
             </vertical>);
         card.setBackground(roundRect("#fffdf8", 12, "#e7e1d4", 1));
         card.time.setText(fmtDateTime(r.ts));
-        card.state.setText(sm.label); card.state.setBackground(roundRect(sm.color, 7, null, 0));
+        card.runState.setText(sm.label); card.runState.setBackground(roundRect(sm.color, 7, null, 0));
         var keys = (r.strategyKeys || []).map(function (k) { return STRAT_CN[k] || k; }).join('·') || '未记录';
         card.meta.setText(r.mode + " · " + keys + (total ? " · 进度 " + done + "/" + total : ""));
         card.stats.setText("成交 " + (r.ok || 0) + "   失败 " + (r.fail || 0) + "   跳过 " + (r.skip || 0) + "   买/卖 " + (r.buy || 0) + "/" + (r.sell || 0));
         var runId = r.id;
-        card.on("click", function () { renderRunDetail(runId); });
+        card.on("click", function () { safeRender("运行详情", function () { renderRunDetail(runId); }); });
         body.addView(card);
     });
     showConfig();
@@ -807,34 +854,36 @@ function renderRunDetail(runId) {
         </horizontal>);
     top.back.setBackground(roundRect("#fffdf8", 12, "#e7e1d4", 1));
     top.sub.setText(fmtDateTime(r.ts));
-    top.back.on("click", function () { renderRunHistory(); }); body.addView(top);
+    top.back.on("click", function () { safeRender("运行历史", renderRunHistory); }); body.addView(top);
 
     var sm = runStatusMeta(r);
     var head = ui.inflate(
         <vertical padding="14 13" margin="0 0 0 10">
             <horizontal gravity="center_vertical">
-                <text id="state" textSize="12sp" textStyle="bold" textColor="#fffdf8" padding="8 4" />
+                <text id="runState" textSize="12sp" textStyle="bold" textColor="#fffdf8" padding="8 4" />
                 <text id="mode" textSize="11sp" textColor="#8b857b" margin="10 0 0 0" layout_weight="1" />
             </horizontal>
             <text id="strategy" textSize="11sp" textColor="#6a645a" margin="0 8 0 0" />
-            <horizontal id="stats" margin="0 11 0 0" />
+            <vertical id="stats" margin="0 11 0 0" />
             <text id="progress" textSize="11sp" textColor="#8b857b" margin="0 8 0 0" />
             <text id="err" visibility="gone" textSize="11sp" textColor="#c0392b" margin="0 6 0 0" />
         </vertical>);
     head.setBackground(roundRect("#fffdf8", 12, "#e7e1d4", 1));
-    head.state.setText(sm.label); head.state.setBackground(roundRect(sm.color, 7, null, 0));
+    head.runState.setText(sm.label); head.runState.setBackground(roundRect(sm.color, 7, null, 0));
     head.mode.setText(r.mode === '模拟' ? '模拟 · 不下单' : '真实下单');
     head.strategy.setText("策略  " + ((r.strategyKeys || []).map(function (k) { return STRAT_CN[k] || k; }).join(' · ') || '未记录'));
     var statCell = function (num, label, color) {
-        var v = ui.inflate(<vertical gravity="center" padding="0 7" layout_weight="1" margin="3 0"><text id="n" textSize="18sp" textStyle="bold" /><text id="l" textSize="10sp" textColor="#8b857b" /></vertical>);
+        var v = ui.inflate(<vertical gravity="center" padding="0 9"><text id="n" w="*" gravity="center" textSize="18sp" textStyle="bold" /><text id="l" w="*" gravity="center" textSize="10sp" textColor="#8b857b" /></vertical>);
         v.n.setText("" + num); v.n.setTextColor(COL(color)); v.l.setText(label); v.setBackground(roundRect("#f6f4ef", 9, "#eee8db", 1)); return v;
     };
     var buyTotal = 0;
     (r.detail || []).forEach(function (d) { if (d.a === 'buy' && (d.s === 'ok' || d.s === 'dry_run_stopped_at_pwd') && d.amt) buyTotal += d.amt; });
-    head.stats.addView(statCell(r.ok || 0, "成交", "#2e8b57"));
-    head.stats.addView(statCell(r.fail || 0, "失败", "#c0392b"));
-    head.stats.addView(statCell(r.skip || 0, "跳过", "#8b857b"));
-    head.stats.addView(statCell(buyTotal ? money(buyTotal).replace("¥", "") : "0", "买入合计", "#5a7a52"));
+    addStatGrid(head.stats, [
+        statCell(r.ok || 0, "成交", "#2e8b57"),
+        statCell(r.fail || 0, "失败", "#c0392b"),
+        statCell(r.skip || 0, "跳过", "#8b857b"),
+        statCell(buyTotal ? money(buyTotal).replace("¥", "") : "0", "买入合计", "#5a7a52")
+    ]);
     var total = (r.plan || []).length || ((r.buy || 0) + (r.sell || 0));
     head.progress.setText("计划 买 " + (r.buy || 0) + " / 卖 " + (r.sell || 0) + (total ? "   已处理 " + (r.nextIndex || 0) + "/" + total : ""));
     if (r.err) { head.err.setText("异常：" + r.err); head.err.setVisibility(0); }
@@ -848,17 +897,17 @@ function renderRunDetail(runId) {
         var st = stMap[d.s] || [d.s || '未知', '#c0392b'];
         var row = ui.inflate(
             <horizontal gravity="center_vertical" padding="12 11" margin="0 0 0 6">
-                <text id="tag" textSize="10sp" textStyle="bold" textColor="#fffdf8" padding="6 3" />
+                <text id="sideTag" textSize="10sp" textStyle="bold" textColor="#fffdf8" padding="6 3" />
                 <vertical layout_weight="1" margin="9 0 0 0"><text id="name" textSize="13sp" textStyle="bold" textColor="#3d342a" /><text id="meta" textSize="10sp" textColor="#8b857b" margin="0 3 0 0" /></vertical>
-                <text id="state" textSize="11sp" textStyle="bold" />
+                <text id="resultState" textSize="11sp" textStyle="bold" />
             </horizontal>);
         row.setBackground(roundRect("#fffdf8", 10, "#e7e1d4", 1));
-        row.tag.setText(isBuy ? '买' : '卖'); row.tag.setBackground(roundRect(isBuy ? '#5a7a52' : '#b0704a', 5, null, 0));
+        row.sideTag.setText(isBuy ? '买' : '卖'); row.sideTag.setBackground(roundRect(isBuy ? '#5a7a52' : '#b0704a', 5, null, 0));
         row.name.setText((i + 1) + ". " + d.name);
         var meta = isBuy ? (d.amt != null ? money(d.amt) : '') : ('卖 1/' + (d.ratio ? Math.round(1 / d.ratio) : '?'));
         if (d.strat) meta += ' · ' + d.strat;
         if (d.m && d.s !== 'ok') meta += ' · ' + d.m;
-        row.meta.setText(meta); row.state.setText(st[0]); row.state.setTextColor(COL(st[1])); body.addView(row);
+        row.meta.setText(meta); row.resultState.setText(st[0]); row.resultState.setTextColor(COL(st[1])); body.addView(row);
     });
     if (r.incomplete && total > (r.nextIndex || 0)) {
         body.addView(ui.inflate(<text id="pending" textColor="#b0704a" textSize="11sp" gravity="center" padding="0 14" />));
@@ -1105,7 +1154,7 @@ function renderConfig() {
 
     var historyCard = buildConfigRow("运行历史", "按每次运行查看状态、汇总与买卖明细",
         loadRunHistory().length + " 次  ›", "#3d342a",
-        function () { renderRunHistory(); });
+        function () { safeRender("运行历史", renderRunHistory); });
     body.addView(historyCard);
 
     var execCard = buildConfigRow("立即执行策略", "扫描全部基金,启用的策略买卖一遍",
@@ -2419,14 +2468,14 @@ function runStrategy(onlyKeys, resumeRun) {
                 summary.endedAt = new Date().getTime();
                 saveRunRecord(summary);
                 hideRunControls();
-                status(control.requested === 'paused' ? "⏸ 已暂停，下次运行时可继续" : "■ 已终止，本次未完成", "#b0704a");
+                status("⏸ 已暂停，下次运行时可继续", "#b0704a");
             } else {
                 summary.status = 'completed'; summary.incomplete = false; summary.resumable = false;
                 summary.phase = 'completed'; summary.endedAt = new Date().getTime();
                 saveRunRecord(summary);
                 hideRunControls();
                 status("完成:成交 " + summary.ok + " / 失败 " + summary.fail + " / 跳过 " + summary.skip, "#2e8b57");
-                // 完成后再采集一次，刷新买卖后的最新持仓；暂停/终止不再做额外自动化。
+                // 完成后再采集一次，刷新买卖后的最新持仓；暂停时不再做额外自动化。
                 try {
                     status("刷新最新数据…");
                     freshData = collectFunds(); saveData(freshData);
@@ -2836,7 +2885,7 @@ if (saved) { render(saved); ui.meta.setText(fmtTs(saved.ts)); }
 
 // 采集按钮
 ui.btn.on("click", function () {
-    if (activeRunControl) { toast("策略运行中，请先暂停或终止后再采集"); return; }
+    if (activeRunControl) { toast("策略运行中，请先暂停后再采集"); return; }
     // 悬浮窗需「显示在其他应用上层」权限;首次使用引导授权
     if (!floaty.checkPermission()) { floaty.requestPermission(); toast("请授予「悬浮窗」权限后再次点击采集"); return; }
     ui.btn.setEnabled(false); ui.btn.setAlpha(0.4);
@@ -2866,7 +2915,7 @@ ui.btn.on("click", function () {
 // 设置按钮 = 交易配置
 ui.cfg.on("click", function () { openConfigUI(); });
 // 时钟按钮 = 运行历史
-ui.histBtn.on("click", function () { renderRunHistory(); });
+ui.histBtn.on("click", function () { safeRender("运行历史", renderRunHistory); });
 // 顶部运行按钮 → 策略选择 + 防误触确认
 ui.runBtn.on("click", function () { openRunPicker(); });
 // overlay 点击消费(防穿透到下层);在 ui.layout 后绑定,此时 ui.overlay 才存在

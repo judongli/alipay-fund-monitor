@@ -1,4 +1,6 @@
 const assert = require('assert');
+const fs = require('fs');
+const path = require('path');
 const {
     createRunRecord,
     recalcRunStats,
@@ -41,5 +43,15 @@ assert.strictEqual(collecting.detail.length, 0);
 collecting.status = 'completed';
 collecting.incomplete = false;
 assert.strictEqual(canResumeRun(collecting), false);
+
+// AutoX 动态视图不能使用 state/tag 这类 Android View 已占用属性名，否则
+// 动态属性取到的不是 TextView（tag 默认甚至是 null），调用 setText 会崩溃。
+const mainSource = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+assert.strictEqual(/id=["'](?:state|tag)["']/.test(mainSource), false);
+assert.strictEqual(/\.(?:state|tag)\.setText\(/.test(mainSource), false);
+assert.strictEqual(/id=["']stopBtn["']/.test(mainSource), false);
+assert.strictEqual(/requestRunStop/.test(mainSource), false);
+assert.strictEqual(/function sizeReportCard\(/.test(mainSource), true);
+assert.strictEqual(/showCard\(card\);\s*sizeReportCard\(card\);/.test(mainSource), true);
 
 console.log('✅ run-history tests passed');
